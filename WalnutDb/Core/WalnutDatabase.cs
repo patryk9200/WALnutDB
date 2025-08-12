@@ -66,6 +66,8 @@ public sealed class WalnutDatabase : IDatabase
     public ValueTask CheckpointAsync(CancellationToken ct = default)
         => ValueTask.CompletedTask; // TODO: flush MemTable -> SST, rotacja WAL
 
+    internal MemTable GetOrAddMemTable(string name) => _tables.GetOrAdd(name, _ => new MemTable());
+
     public async ValueTask<ITable<T>> OpenTableAsync<T>(string name, TableOptions<T> options, CancellationToken ct = default)
     {
         var mem = _tables.GetOrAdd(name, _ => new MemTable());
