@@ -63,7 +63,10 @@ public sealed class CheckpointTests
             int count = 0;
             await foreach (var d in t2.ScanByIndexAsync("I", start, end))
                 count++;
+
             Assert.Equal(1, count);
+            var walInfo = new FileInfo(walPath);
+            Assert.Equal(0, walInfo.Length);
         }
     }
 }

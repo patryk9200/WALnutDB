@@ -131,8 +131,8 @@ public sealed class WalnutDatabase : IDatabase
                 File.Move(tmp, dst);
 
             ReplaceSst(name, dst); // <— kluczujemy LOGICZNĄ nazwą
-
-            // Uwaga: nie czyścimy MemTable na MVP (to zachowuje prostotę). Później dodamy swap/clear + rotację WAL.
+            await Wal.FlushAsync(ct).ConfigureAwait(false);
+            await Wal.TruncateAsync(ct).ConfigureAwait(false);
         }
 
         // spłucz WAL dla trwałości (rotację dorobimy w kolejnym kroku)

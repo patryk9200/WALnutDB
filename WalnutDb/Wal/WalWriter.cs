@@ -22,6 +22,7 @@ public sealed class WalWriter : IWalWriter
     private readonly CancellationTokenSource _cts = new();
     private readonly Task _loop;
     private readonly Crc32 _crc = new();
+    private readonly SemaphoreSlim _ioGate = new(1, 1); // serializacja operacji
 
     public WalWriter(string path, TimeSpan? groupWindow = null, int maxBatch = 256)
     {
@@ -37,6 +38,26 @@ public sealed class WalWriter : IWalWriter
         });
         _fs.Seek(0, SeekOrigin.End);
         _loop = Task.Run(WriterLoopAsync);
+    }
+
+    public async ValueTask TruncateAsync(CancellationToken ct = default)
+    {
+        await _ioGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            // dopilnuj flushu bieżących batchy
+            await FlushAsync(ct).ConfigureAwait(false);
+
+            // wyzeruj plik
+            _fs.Position = 0;
+            _fs.SetLength(0);
+
+            await _fs.FlushAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _ioGate.Release();
+        }
     }
 
     public async ValueTask<CommitHandle> AppendTransactionAsync(IReadOnlyList<ReadOnlyMemory<byte>> frames, Durability durability, CancellationToken ct = default)
