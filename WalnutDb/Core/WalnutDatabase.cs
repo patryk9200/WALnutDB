@@ -1,5 +1,8 @@
 ﻿using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
+using WalnutDb.Sst;
+using System.Linq;
+using System.Text;
 
 using WalnutDb.Wal;
 
@@ -11,7 +14,8 @@ public sealed class WalnutDatabase : IDatabase
     private readonly DatabaseOptions _options;
     private readonly IManifestStore _manifest;
     internal readonly IWalWriter Wal;
-
+    private readonly string _sstDir;
+    private readonly ConcurrentDictionary<string, SstReader> _sst = new();
     private ulong _nextSeqNo = 1;
     internal readonly SemaphoreSlim WriterLock = new(1, 1); // single-writer apply
 
@@ -27,8 +31,114 @@ public sealed class WalnutDatabase : IDatabase
         _typeNames = typeResolver ?? new DefaultTypeNameResolver(options);
         Directory.CreateDirectory(_dir);
         WalRecovery.Replay(Path.Combine(_dir, "wal.log"), _tables);
+        _sstDir = Path.Combine(_dir, "sst");
+        Directory.CreateDirectory(_sstDir);
 
+        foreach (var file in Directory.EnumerateFiles(_sstDir, "*.sst"))
+        {
+            var baseName = Path.GetFileNameWithoutExtension(file);
+            var logicalName = DecodeNameFromFile(baseName); // <—
+            try { _sst[logicalName] = new SstReader(file); } catch { /* ignore */ }
+        }
     }
+
+    internal MemTable GetOrAddMemTable(string name) => _tables.GetOrAdd(name, _ => new MemTable());
+
+    internal bool TryGetFromSst(string name, ReadOnlySpan<byte> key, out byte[]? value)
+    {
+        value = null;
+        if (_sst.TryGetValue(name, out var sst))
+            return sst.TryGet(key, out value);
+        return false;
+    }
+
+    internal IEnumerable<(byte[] Key, byte[] Val)> ScanSstRange(string name, byte[] fromInclusive, byte[] toExclusive)
+    {
+        if (_sst.TryGetValue(name, out var sst))
+            return sst.ScanRange(fromInclusive, toExclusive);
+        return Array.Empty<(byte[] Key, byte[] Val)>();
+    }
+
+    private void ReplaceSst(string name, string newPath)
+    {
+        var reader = new SstReader(newPath);
+        if (_sst.TryRemove(name, out var old))
+        {
+            try { old.Dispose(); } catch { }
+        }
+        _sst[name] = reader;
+    }
+
+    private static string EncodeNameToFile(string logicalName)
+    {
+        // Base64-url bez paddingu: tylko [A-Za-z0-9-_]
+        var bytes = Encoding.UTF8.GetBytes(logicalName);
+        var b64 = Convert.ToBase64String(bytes).Replace('+', '-').Replace('/', '_').TrimEnd('=');
+        return b64;
+    }
+    private static string DecodeNameFromFile(string fileBaseName)
+    {
+        var s = fileBaseName.Replace('-', '+').Replace('_', '/');
+        // przywróć padding
+        switch (s.Length % 4) { case 2: s += "=="; break; case 3: s += "="; break; }
+        var bytes = Convert.FromBase64String(s);
+        return Encoding.UTF8.GetString(bytes);
+    }
+
+
+    public async ValueTask CheckpointAsync(CancellationToken ct = default)
+    {
+        // Dla każdej MemTable (w tym index_*), zapisz SST i podmień readera.
+        foreach (var kv in _tables.ToArray())
+        {
+            ct.ThrowIfCancellationRequested();
+            var name = kv.Key;
+            var mem = kv.Value;
+
+            // zbierz live wpisy i posortuj leksykograficznie po kluczu
+            var list = new List<(byte[] Key, byte[] Val)>();
+            foreach (var it in mem.SnapshotAll(null))
+            {
+                if (!it.Value.Tombstone && it.Value.Value is not null)
+                    list.Add((it.Key, it.Value.Value));
+            }
+            list.Sort(static (a, b) =>
+            {
+                int min = Math.Min(a.Key.Length, b.Key.Length);
+                for (int i = 0; i < min; i++)
+                {
+                    int d = a.Key[i] - b.Key[i];
+                    if (d != 0) return d;
+                }
+                return a.Key.Length - b.Key.Length;
+            });
+
+            // zbuduj async źródło (bez Span w async)
+            async IAsyncEnumerable<(byte[] Key, byte[] Val)> SortedAsync()
+            {
+                foreach (var t in list) { yield return t; await Task.Yield(); }
+            }
+
+            var safe = EncodeNameToFile(name); // <—
+            var tmp = Path.Combine(_sstDir, $"{safe}.sst.tmp");
+            var dst = Path.Combine(_sstDir, $"{safe}.sst");
+            await SstWriter.WriteAsync(tmp, SortedAsync(), ct).ConfigureAwait(false);
+
+            // atomowa podmiana
+            if (File.Exists(dst))
+                File.Replace(tmp, dst, destinationBackupFileName: null);
+            else
+                File.Move(tmp, dst);
+
+            ReplaceSst(name, dst); // <— kluczujemy LOGICZNĄ nazwą
+
+            // Uwaga: nie czyścimy MemTable na MVP (to zachowuje prostotę). Później dodamy swap/clear + rotację WAL.
+        }
+
+        // spłucz WAL dla trwałości (rotację dorobimy w kolejnym kroku)
+        await Wal.FlushAsync(ct).ConfigureAwait(false);
+    }
+
 
     // ---------- IDatabase ----------
 
@@ -57,16 +167,14 @@ public sealed class WalnutDatabase : IDatabase
 
     public async ValueTask DisposeAsync()
     {
+        foreach (var s in _sst.Values)
+            try { s.Dispose(); } catch { }
+        _sst.Clear();
         await Wal.DisposeAsync().ConfigureAwait(false);
     }
 
     public ValueTask FlushAsync(CancellationToken ct = default)
     => Wal.FlushAsync(ct);
-
-    public ValueTask CheckpointAsync(CancellationToken ct = default)
-        => ValueTask.CompletedTask; // TODO: flush MemTable -> SST, rotacja WAL
-
-    internal MemTable GetOrAddMemTable(string name) => _tables.GetOrAdd(name, _ => new MemTable());
 
     public async ValueTask<ITable<T>> OpenTableAsync<T>(string name, TableOptions<T> options, CancellationToken ct = default)
     {

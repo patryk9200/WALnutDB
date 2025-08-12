@@ -211,6 +211,10 @@ internal sealed class DefaultTable<T> : ITable<T>
         var key = _map.EncodeIdToBytes(id);
         if (_mem.TryGet(key, out var raw) && raw is not null)
             return ValueTask.FromResult<T?>(_map.Deserialize(raw));
+
+        if (_db.TryGetFromSst(_name, key, out var fromSst) && fromSst is not null)
+            return ValueTask.FromResult<T?>(_map.Deserialize(fromSst));
+
         return ValueTask.FromResult<T?>(default);
     }
 
@@ -244,20 +248,78 @@ internal sealed class DefaultTable<T> : ITable<T>
 
     public async IAsyncEnumerable<T> ScanByKeyAsync(ReadOnlyMemory<byte> fromInclusive, ReadOnlyMemory<byte> toExclusive, int pageSize = 1024, ReadOnlyMemory<byte> token = default, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
-        var from = fromInclusive.ToArray();
-        var to = toExclusive.ToArray();
-        byte[]? after = token.IsEmpty ? null : token.ToArray();
+        var from = fromInclusive.IsEmpty ? Array.Empty<byte>() : fromInclusive.ToArray();
+        var to = toExclusive.IsEmpty ? Array.Empty<byte>() : toExclusive.ToArray();
+        var after = token.IsEmpty ? null : token.ToArray();
+
+        var memEnum = _mem.SnapshotRange(from, to, after).GetEnumerator();
+        var sstEnum = _db.ScanSstRange(_name, from, to).GetEnumerator();
+
+        bool hasMem = memEnum.MoveNext();
+        bool hasSst = sstEnum.MoveNext();
 
         int sent = 0;
-        foreach (var kv in _mem.SnapshotRange(from, to, after))
+        byte[]? lastKey = null;
+
+        while (hasMem || hasSst)
         {
             ct.ThrowIfCancellationRequested();
-            if (!kv.Value.Tombstone)
+
+            // wybierz źródło z mniejszym kluczem; przy równości preferuj Mem
+            bool useMem;
+            if (hasMem && hasSst)
             {
-                yield return _map.Deserialize(kv.Value.Value!);
-                if (++sent >= pageSize) { sent = 0; await Task.Yield(); }
+                int cmp = ByteCompare(memEnum.Current.Key, sstEnum.Current.Key);
+                useMem = cmp <= 0; // mem first on equal
+            }
+            else useMem = hasMem;
+
+            if (useMem)
+            {
+                var rec = memEnum.Current;
+                hasMem = memEnum.MoveNext();
+
+                if (!rec.Value.Tombstone && rec.Value.Value is not null)
+                {
+                    if (after is null || ByteCompare(rec.Key, after) > 0)
+                    {
+                        yield return _map.Deserialize(rec.Value.Value);
+                        if (++sent >= pageSize) { sent = 0; await Task.Yield(); }
+                    }
+                    lastKey = rec.Key;
+                }
+
+                // jeśli memKey == sstKey, to zużyj też sst (ale go nie emituj – mem wygrał)
+                if (hasSst && lastKey is not null && ByteCompare(lastKey, sstEnum.Current.Key) == 0)
+                    hasSst = sstEnum.MoveNext();
+            }
+            else
+            {
+                var rec = sstEnum.Current;
+                hasSst = sstEnum.MoveNext();
+
+                // sprawdź, czy mem ma tombstone/override dla tego klucza — nie mamy szybkiej mapy,
+                // ale mem snapshot już przebiegliśmy do pozycji <= rec.Key. Jeśli mem jest mniejszy – OK.
+                // W praktyce duplikat (equal) byłby zjedzony wcześniej przez useMem==true.
+
+                if (after is null || ByteCompare(rec.Key, after) > 0)
+                {
+                    yield return _map.Deserialize(rec.Val);
+                    if (++sent >= pageSize) { sent = 0; await Task.Yield(); }
+                }
             }
         }
+    }
+
+    private static int ByteCompare(byte[] a, byte[] b)
+    {
+        int min = Math.Min(a.Length, b.Length);
+        for (int i = 0; i < min; i++)
+        {
+            int d = a[i] - b[i];
+            if (d != 0) return d;
+        }
+        return a.Length - b.Length;
     }
 
     public async IAsyncEnumerable<T> ScanByIndexAsync(string indexName, ReadOnlyMemory<byte> start, ReadOnlyMemory<byte> end, int pageSize = 1024, ReadOnlyMemory<byte> token = default, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
@@ -266,22 +328,74 @@ internal sealed class DefaultTable<T> : ITable<T>
         if (idx is null)
             throw new ArgumentException($"Index '{indexName}' not found on table '{_name}'.", nameof(indexName));
 
-        var from = start.ToArray();
-        var to = end.ToArray();
-        byte[]? after = token.IsEmpty ? null : token.ToArray();
+        var from = start.IsEmpty ? Array.Empty<byte>() : start.ToArray();
+        var to = end.IsEmpty ? Array.Empty<byte>() : end.ToArray();
+        var after = token.IsEmpty ? null : token.ToArray();
+
+        var memEnum = idx.Mem.SnapshotRange(from, to, after).GetEnumerator();
+        var sstEnum = _db.ScanSstRange(idx.IndexTableName, from, to).GetEnumerator();
+
+        bool hasMem = memEnum.MoveNext();
+        bool hasSst = sstEnum.MoveNext();
 
         int sent = 0;
-        foreach (var kv in idx.Mem.SnapshotRange(from, to, after))
+        byte[]? lastKey = null;
+
+        while (hasMem || hasSst)
         {
             ct.ThrowIfCancellationRequested();
-            if (kv.Value.Tombstone) continue;
 
-            var pk = IndexKeyCodec.ExtractPrimaryKey(kv.Key);
-            var obj = await GetAsync((object)pk, ct).ConfigureAwait(false);
-            if (obj is not null)
+            bool useMem;
+            if (hasMem && hasSst)
             {
-                yield return obj;
-                if (++sent >= pageSize) { sent = 0; await Task.Yield(); }
+                int cmp = ByteCompare(memEnum.Current.Key, sstEnum.Current.Key);
+                useMem = cmp <= 0; // mem first on equal
+            }
+            else useMem = hasMem;
+
+            byte[]? pk = null;
+
+            if (useMem)
+            {
+                var rec = memEnum.Current;
+                hasMem = memEnum.MoveNext();
+
+                if (!rec.Value.Tombstone)
+                {
+                    var composite = rec.Key;
+                    pk = Indexing.IndexKeyCodec.ExtractPrimaryKey(composite);
+                    if (after is null || ByteCompare(composite, after) > 0)
+                    {
+                        var obj = await GetAsync((object)pk, ct).ConfigureAwait(false);
+                        if (obj is not null)
+                        {
+                            yield return obj;
+                            if (++sent >= pageSize) { sent = 0; await Task.Yield(); }
+                        }
+                    }
+                    lastKey = composite;
+                }
+
+                if (hasSst && lastKey is not null && ByteCompare(lastKey, sstEnum.Current.Key) == 0)
+                    hasSst = sstEnum.MoveNext();
+            }
+            else
+            {
+                var rec = sstEnum.Current;
+                hasSst = sstEnum.MoveNext();
+
+                // composite key → primary key
+                pk = Indexing.IndexKeyCodec.ExtractPrimaryKey(rec.Key);
+
+                if (after is null || ByteCompare(rec.Key, after) > 0)
+                {
+                    var obj = await GetAsync((object)pk, ct).ConfigureAwait(false);
+                    if (obj is not null)
+                    {
+                        yield return obj;
+                        if (++sent >= pageSize) { sent = 0; await Task.Yield(); }
+                    }
+                }
             }
         }
     }
