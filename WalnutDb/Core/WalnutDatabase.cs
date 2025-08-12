@@ -18,8 +18,7 @@ public sealed class WalnutDatabase : IDatabase
     private readonly ConcurrentDictionary<string, SstReader> _sst = new();
     private ulong _nextSeqNo = 1;
     internal readonly SemaphoreSlim WriterLock = new(1, 1); // single-writer apply
-
-    private readonly ConcurrentDictionary<string, MemTable> _tables = new();
+    private readonly ConcurrentDictionary<string, MemTableRef> _tables = new();
     private readonly ITypeNameResolver _typeNames;
 
     public WalnutDatabase(string directory, DatabaseOptions options, IManifestStore manifest, IWalWriter wal, ITypeNameResolver? typeResolver = null)
@@ -30,7 +29,12 @@ public sealed class WalnutDatabase : IDatabase
         Wal = wal;
         _typeNames = typeResolver ?? new DefaultTypeNameResolver(options);
         Directory.CreateDirectory(_dir);
-        WalRecovery.Replay(Path.Combine(_dir, "wal.log"), _tables);
+
+        var recovered = new ConcurrentDictionary<string, MemTable>();
+        WalRecovery.Replay(Path.Combine(_dir, "wal.log"), recovered);
+        foreach (var kv in recovered)
+            _tables[kv.Key] = new MemTableRef(kv.Value);
+
         _sstDir = Path.Combine(_dir, "sst");
         Directory.CreateDirectory(_sstDir);
 
@@ -42,7 +46,12 @@ public sealed class WalnutDatabase : IDatabase
         }
     }
 
-    internal MemTable GetOrAddMemTable(string name) => _tables.GetOrAdd(name, _ => new MemTable());
+    internal MemTableRef GetOrAddMemRef(string name)
+    => _tables.GetOrAdd(name, _ => new MemTableRef(new MemTable()));
+
+    // (opcjonalnie dla zgodności – jeśli coś jeszcze woła starą wersję)
+    internal MemTable GetOrAddMemTable(string name) => GetOrAddMemRef(name).Current;
+
 
     internal bool TryGetFromSst(string name, ReadOnlySpan<byte> key, out byte[]? value)
     {
@@ -85,19 +94,28 @@ public sealed class WalnutDatabase : IDatabase
         return Encoding.UTF8.GetString(bytes);
     }
 
-
     public async ValueTask CheckpointAsync(CancellationToken ct = default)
     {
-        // Dla każdej MemTable (w tym index_*), zapisz SST i podmień readera.
+        // 1) Freeze & swap – podmień wszystkie memki na nowe
+        var snapshot = new List<(string Name, MemTable Old)>(_tables.Count);
         foreach (var kv in _tables.ToArray())
         {
             ct.ThrowIfCancellationRequested();
             var name = kv.Key;
-            var mem = kv.Value;
+            var refm = kv.Value;
 
-            // zbierz live wpisy i posortuj leksykograficznie po kluczu
+            var old = refm.Current;
+            var fresh = new MemTable();
+            refm.Current = fresh;            // nowe inserty lecą już tutaj
+
+            snapshot.Add((name, old));       // tę starą zrzucimy do SST
+        }
+
+        // 2) Zapis snapshotów do SST
+        foreach (var (name, oldMem) in snapshot)
+        {
             var list = new List<(byte[] Key, byte[] Val)>();
-            foreach (var it in mem.SnapshotAll(null))
+            foreach (var it in oldMem.SnapshotAll(null))
             {
                 if (!it.Value.Tombstone && it.Value.Value is not null)
                     list.Add((it.Key, it.Value.Value));
@@ -105,40 +123,31 @@ public sealed class WalnutDatabase : IDatabase
             list.Sort(static (a, b) =>
             {
                 int min = Math.Min(a.Key.Length, b.Key.Length);
-                for (int i = 0; i < min; i++)
-                {
-                    int d = a.Key[i] - b.Key[i];
-                    if (d != 0) return d;
-                }
+                for (int i = 0; i < min; i++) { int d = a.Key[i] - b.Key[i]; if (d != 0) return d; }
                 return a.Key.Length - b.Key.Length;
             });
 
-            // zbuduj async źródło (bez Span w async)
             async IAsyncEnumerable<(byte[] Key, byte[] Val)> SortedAsync()
             {
                 foreach (var t in list) { yield return t; await Task.Yield(); }
             }
 
-            var safe = EncodeNameToFile(name); // <—
+            var safe = EncodeNameToFile(name);
             var tmp = Path.Combine(_sstDir, $"{safe}.sst.tmp");
             var dst = Path.Combine(_sstDir, $"{safe}.sst");
+
             await SstWriter.WriteAsync(tmp, SortedAsync(), ct).ConfigureAwait(false);
+            if (File.Exists(dst)) File.Replace(tmp, dst, destinationBackupFileName: null);
+            else File.Move(tmp, dst);
 
-            // atomowa podmiana
-            if (File.Exists(dst))
-                File.Replace(tmp, dst, destinationBackupFileName: null);
-            else
-                File.Move(tmp, dst);
-
-            ReplaceSst(name, dst); // <— kluczujemy LOGICZNĄ nazwą
-            await Wal.FlushAsync(ct).ConfigureAwait(false);
-            await Wal.TruncateAsync(ct).ConfigureAwait(false);
+            ReplaceSst(name, dst);
+            // oldMem wyleci z GC
         }
 
-        // spłucz WAL dla trwałości (rotację dorobimy w kolejnym kroku)
+        // 3) WAL: jeden flush + truncate po wszystkim
         await Wal.FlushAsync(ct).ConfigureAwait(false);
+        await Wal.TruncateAsync(ct).ConfigureAwait(false);
     }
-
 
     // ---------- IDatabase ----------
 
@@ -178,9 +187,9 @@ public sealed class WalnutDatabase : IDatabase
 
     public async ValueTask<ITable<T>> OpenTableAsync<T>(string name, TableOptions<T> options, CancellationToken ct = default)
     {
-        var mem = _tables.GetOrAdd(name, _ => new MemTable());
-        await Task.Yield(); // utrzymać async signaturę bez ostrzeżeń
-        return new DefaultTable<T>(this, name, options, mem);
+        var memRef = GetOrAddMemRef(name);
+        await Task.Yield();
+        return new DefaultTable<T>(this, name, options, memRef);
     }
 
     public ValueTask<ITable<T>> OpenTableAsync<T>(TableOptions<T> options, CancellationToken ct = default)

@@ -68,15 +68,22 @@ internal sealed class MemTable
         return new ArraySegment<KeyValuePair<byte[], Entry>>(list.ToArray(), start, list.Count - start);
     }
 
-    public IEnumerable<KeyValuePair<byte[], Entry>> SnapshotRange(byte[] fromInclusive, byte[] toExclusive, byte[]? afterKeyExclusive = null)
+    public IEnumerable<KeyValuePair<byte[], Entry>> SnapshotRange(
+     byte[] fromInclusive,
+     byte[] toExclusive,
+     byte[]? afterKeyExclusive = null)
     {
         var cmp = ByteArrayComparer.Instance;
         var all = SnapshotAll(afterKeyExclusive);
+
+        bool unbounded = toExclusive.Length == 0;
+
         foreach (var kv in all)
         {
             if (cmp.Compare(kv.Key, fromInclusive) < 0) continue;
-            if (cmp.Compare(kv.Key, toExclusive) >= 0) yield break;
+            if (!unbounded && cmp.Compare(kv.Key, toExclusive) >= 0) yield break;
             yield return kv;
         }
     }
+
 }

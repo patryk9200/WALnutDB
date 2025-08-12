@@ -15,39 +15,39 @@ internal sealed class DefaultTable<T> : ITable<T>
     private readonly WalnutDatabase _db;
     private readonly string _name;
     private readonly TableMapper<T> _map;
-    private readonly MemTable _mem;
+    private readonly MemTableRef _memRef;
 
     private sealed class IndexDef
     {
         public required string Name { get; init; }
         public required Func<T, object?> Extract { get; init; }
         public required string IndexTableName { get; init; }
-        public required MemTable Mem { get; init; }
+        public required MemTableRef Mem { get; init; }
         public int? DecimalScale { get; init; }
-        public bool Unique { get; init; } // TODO: walidacja unikalności (MVP: jeszcze nie egzekwujemy)
+        public bool Unique { get; init; } // miejsce na przyszłą walidację unikalności
     }
 
     private readonly List<IndexDef> _indexes = new();
 
-    public DefaultTable(WalnutDatabase db, string name, TableOptions<T> options, MemTable mem)
+    public DefaultTable(WalnutDatabase db, string name, TableOptions<T> options, MemTableRef memRef)
     {
-        _db = db; _name = name; _map = new TableMapper<T>(options); _mem = mem;
+        _db = db; _name = name; _map = new TableMapper<T>(options); _memRef = memRef;
 
-        // Odkryj wszystkie atrybuty [DbIndex("...")] na publicznych właściwościach
+        // Odkryj wszystkie indeksy [DbIndex(...)] na publicznych właściwościach
         foreach (var prop in typeof(T).GetProperties(BindingFlags.Instance | BindingFlags.Public))
         {
             foreach (var attr in prop.GetCustomAttributes<DbIndexAttribute>())
             {
-                var idxName = attr.Name; // wymagane przez Twój ctor
+                var idxName = attr.Name; // wymagane przez Twój atrybut
                 var indexTable = $"__index__{_name}__{idxName}";
-                var idxMem = _db.GetOrAddMemTable(indexTable);
+                var idxMemRef = _db.GetOrAddMemRef(indexTable);
 
                 _indexes.Add(new IndexDef
                 {
                     Name = idxName,
                     Extract = (T obj) => prop.GetValue(obj),
                     IndexTableName = indexTable,
-                    Mem = idxMem,
+                    Mem = idxMemRef,
                     DecimalScale = attr.DecimalScale,
                     Unique = attr.Unique
                 });
@@ -95,10 +95,10 @@ internal sealed class DefaultTable<T> : ITable<T>
         var key = _map.GetKeyBytes(item);
         var val = _map.Serialize(item);
 
-        // stary rekord (jeśli istnieje) – do aktualizacji indeksów
+        // stary rekord (jeśli mamy go w bieżącej memce) — potrzebny do aktualizacji indeksów
         bool hasOld = false;
         T old = default!;
-        if (_mem.TryGet(key, out var rawOld) && rawOld is not null)
+        if (_memRef.Current.TryGet(key, out var rawOld) && rawOld is not null)
         {
             old = _map.Deserialize(rawOld);
             hasOld = true;
@@ -106,9 +106,9 @@ internal sealed class DefaultTable<T> : ITable<T>
 
         // główny PUT
         tx.AddPut(_name, key, val);
-        tx.AddApply(() => _mem.Upsert(key, val));
+        tx.AddApply(() => _memRef.Current.Upsert(key, val));
 
-        // indeksy
+        // indeksy (pojedyncze pola)
         foreach (var idx in _indexes)
         {
             var newValObj = idx.Extract(item);
@@ -123,14 +123,12 @@ internal sealed class DefaultTable<T> : ITable<T>
                 {
                     var oldIdxKey = IndexKeyCodec.ComposeIndexEntryKey(oldPrefix, key);
                     tx.AddDelete(idx.IndexTableName, oldIdxKey);
-                    tx.AddApply(() => idx.Mem.Delete(oldIdxKey));
+                    tx.AddApply(() => idx.Mem.Current.Delete(oldIdxKey));
                 }
             }
 
             tx.AddPut(idx.IndexTableName, newIdxKey, Array.Empty<byte>());
-            tx.AddApply(() => idx.Mem.Upsert(newIdxKey, Array.Empty<byte>()));
-
-            // TODO (Unique): tutaj można dograć sprawdzenie kolizji w zakresie [newPrefix, nextPrefix)
+            tx.AddApply(() => idx.Mem.Current.Upsert(newIdxKey, Array.Empty<byte>()));
         }
 
         return ValueTask.FromResult(true);
@@ -145,14 +143,14 @@ internal sealed class DefaultTable<T> : ITable<T>
 
         bool hasOld = false;
         T old = default!;
-        if (_mem.TryGet(key, out var rawOld) && rawOld is not null)
+        if (_memRef.Current.TryGet(key, out var rawOld) && rawOld is not null)
         {
             old = _map.Deserialize(rawOld);
             hasOld = true;
         }
 
         tx.AddDelete(_name, key);
-        tx.AddApply(() => _mem.Delete(key));
+        tx.AddApply(() => _memRef.Current.Delete(key));
 
         if (hasOld)
         {
@@ -162,7 +160,7 @@ internal sealed class DefaultTable<T> : ITable<T>
                 var oldPrefix = IndexKeyCodec.Encode(oldValObj, idx.DecimalScale);
                 var oldIdxKey = IndexKeyCodec.ComposeIndexEntryKey(oldPrefix, key);
                 tx.AddDelete(idx.IndexTableName, oldIdxKey);
-                tx.AddApply(() => idx.Mem.Delete(oldIdxKey));
+                tx.AddApply(() => idx.Mem.Current.Delete(oldIdxKey));
             }
         }
 
@@ -176,13 +174,13 @@ internal sealed class DefaultTable<T> : ITable<T>
 
         var key = _map.GetKeyBytes(item);
 
-        bool hasOld = true; // jeśli nie ma w MemTable, użyjemy wartości z item
+        bool hasOld = true; // jeśli w memce nie ma, użyjemy wartości z item
         T old = item;
-        if (_mem.TryGet(key, out var rawOld) && rawOld is not null)
+        if (_memRef.Current.TryGet(key, out var rawOld) && rawOld is not null)
             old = _map.Deserialize(rawOld);
 
         tx.AddDelete(_name, key);
-        tx.AddApply(() => _mem.Delete(key));
+        tx.AddApply(() => _memRef.Current.Delete(key));
 
         if (hasOld)
         {
@@ -192,7 +190,7 @@ internal sealed class DefaultTable<T> : ITable<T>
                 var oldPrefix = IndexKeyCodec.Encode(oldValObj, idx.DecimalScale);
                 var oldIdxKey = IndexKeyCodec.ComposeIndexEntryKey(oldPrefix, key);
                 tx.AddDelete(idx.IndexTableName, oldIdxKey);
-                tx.AddApply(() => idx.Mem.Delete(oldIdxKey));
+                tx.AddApply(() => idx.Mem.Current.Delete(oldIdxKey));
             }
         }
 
@@ -209,7 +207,7 @@ internal sealed class DefaultTable<T> : ITable<T>
     public ValueTask<T?> GetAsync(object id, CancellationToken ct = default)
     {
         var key = _map.EncodeIdToBytes(id);
-        if (_mem.TryGet(key, out var raw) && raw is not null)
+        if (_memRef.Current.TryGet(key, out var raw) && raw is not null)
             return ValueTask.FromResult<T?>(_map.Deserialize(raw));
 
         if (_db.TryGetFromSst(_name, key, out var fromSst) && fromSst is not null)
@@ -231,20 +229,17 @@ internal sealed class DefaultTable<T> : ITable<T>
     public ValueTask<T?> GetFirstAsync(Func<T, bool> predicate, IndexHint hint, CancellationToken ct = default)
         => GetFirstAsync(predicate, ct); // MVP: hint ignorowany
 
-    public async IAsyncEnumerable<T> GetAllAsync(int pageSize = 1024, ReadOnlyMemory<byte> token = default, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+    public async IAsyncEnumerable<T> GetAllAsync(
+    int pageSize = 1024,
+    ReadOnlyMemory<byte> token = default,
+    [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
-        byte[]? after = token.IsEmpty ? null : token.ToArray();
-        int sent = 0;
-        foreach (var kv in _mem.SnapshotAll(after))
-        {
-            ct.ThrowIfCancellationRequested();
-            if (!kv.Value.Tombstone)
-            {
-                yield return _map.Deserialize(kv.Value.Value!);
-                if (++sent >= pageSize) { sent = 0; await Task.Yield(); }
-            }
-        }
+        var empty = ReadOnlyMemory<byte>.Empty;
+        await foreach (var item in ScanByKeyAsync(empty, empty, pageSize, token, ct))
+            yield return item;
     }
+
+
 
     public async IAsyncEnumerable<T> ScanByKeyAsync(ReadOnlyMemory<byte> fromInclusive, ReadOnlyMemory<byte> toExclusive, int pageSize = 1024, ReadOnlyMemory<byte> token = default, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
@@ -252,7 +247,7 @@ internal sealed class DefaultTable<T> : ITable<T>
         var to = toExclusive.IsEmpty ? Array.Empty<byte>() : toExclusive.ToArray();
         var after = token.IsEmpty ? null : token.ToArray();
 
-        var memEnum = _mem.SnapshotRange(from, to, after).GetEnumerator();
+        var memEnum = _memRef.Current.SnapshotRange(from, to, after).GetEnumerator();
         var sstEnum = _db.ScanSstRange(_name, from, to).GetEnumerator();
 
         bool hasMem = memEnum.MoveNext();
@@ -264,15 +259,7 @@ internal sealed class DefaultTable<T> : ITable<T>
         while (hasMem || hasSst)
         {
             ct.ThrowIfCancellationRequested();
-
-            // wybierz źródło z mniejszym kluczem; przy równości preferuj Mem
-            bool useMem;
-            if (hasMem && hasSst)
-            {
-                int cmp = ByteCompare(memEnum.Current.Key, sstEnum.Current.Key);
-                useMem = cmp <= 0; // mem first on equal
-            }
-            else useMem = hasMem;
+            bool useMem = hasMem && (!hasSst || ByteCompare(memEnum.Current.Key, sstEnum.Current.Key) <= 0);
 
             if (useMem)
             {
@@ -289,7 +276,6 @@ internal sealed class DefaultTable<T> : ITable<T>
                     lastKey = rec.Key;
                 }
 
-                // jeśli memKey == sstKey, to zużyj też sst (ale go nie emituj – mem wygrał)
                 if (hasSst && lastKey is not null && ByteCompare(lastKey, sstEnum.Current.Key) == 0)
                     hasSst = sstEnum.MoveNext();
             }
@@ -298,10 +284,6 @@ internal sealed class DefaultTable<T> : ITable<T>
                 var rec = sstEnum.Current;
                 hasSst = sstEnum.MoveNext();
 
-                // sprawdź, czy mem ma tombstone/override dla tego klucza — nie mamy szybkiej mapy,
-                // ale mem snapshot już przebiegliśmy do pozycji <= rec.Key. Jeśli mem jest mniejszy – OK.
-                // W praktyce duplikat (equal) byłby zjedzony wcześniej przez useMem==true.
-
                 if (after is null || ByteCompare(rec.Key, after) > 0)
                 {
                     yield return _map.Deserialize(rec.Val);
@@ -309,17 +291,6 @@ internal sealed class DefaultTable<T> : ITable<T>
                 }
             }
         }
-    }
-
-    private static int ByteCompare(byte[] a, byte[] b)
-    {
-        int min = Math.Min(a.Length, b.Length);
-        for (int i = 0; i < min; i++)
-        {
-            int d = a[i] - b[i];
-            if (d != 0) return d;
-        }
-        return a.Length - b.Length;
     }
 
     public async IAsyncEnumerable<T> ScanByIndexAsync(string indexName, ReadOnlyMemory<byte> start, ReadOnlyMemory<byte> end, int pageSize = 1024, ReadOnlyMemory<byte> token = default, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
@@ -332,7 +303,7 @@ internal sealed class DefaultTable<T> : ITable<T>
         var to = end.IsEmpty ? Array.Empty<byte>() : end.ToArray();
         var after = token.IsEmpty ? null : token.ToArray();
 
-        var memEnum = idx.Mem.SnapshotRange(from, to, after).GetEnumerator();
+        var memEnum = idx.Mem.Current.SnapshotRange(from, to, after).GetEnumerator();
         var sstEnum = _db.ScanSstRange(idx.IndexTableName, from, to).GetEnumerator();
 
         bool hasMem = memEnum.MoveNext();
@@ -344,16 +315,7 @@ internal sealed class DefaultTable<T> : ITable<T>
         while (hasMem || hasSst)
         {
             ct.ThrowIfCancellationRequested();
-
-            bool useMem;
-            if (hasMem && hasSst)
-            {
-                int cmp = ByteCompare(memEnum.Current.Key, sstEnum.Current.Key);
-                useMem = cmp <= 0; // mem first on equal
-            }
-            else useMem = hasMem;
-
-            byte[]? pk = null;
+            bool useMem = hasMem && (!hasSst || ByteCompare(memEnum.Current.Key, sstEnum.Current.Key) <= 0);
 
             if (useMem)
             {
@@ -363,7 +325,7 @@ internal sealed class DefaultTable<T> : ITable<T>
                 if (!rec.Value.Tombstone)
                 {
                     var composite = rec.Key;
-                    pk = Indexing.IndexKeyCodec.ExtractPrimaryKey(composite);
+                    var pk = IndexKeyCodec.ExtractPrimaryKey(composite);
                     if (after is null || ByteCompare(composite, after) > 0)
                     {
                         var obj = await GetAsync((object)pk, ct).ConfigureAwait(false);
@@ -384,9 +346,7 @@ internal sealed class DefaultTable<T> : ITable<T>
                 var rec = sstEnum.Current;
                 hasSst = sstEnum.MoveNext();
 
-                // composite key → primary key
-                pk = Indexing.IndexKeyCodec.ExtractPrimaryKey(rec.Key);
-
+                var pk = IndexKeyCodec.ExtractPrimaryKey(rec.Key);
                 if (after is null || ByteCompare(rec.Key, after) > 0)
                 {
                     var obj = await GetAsync((object)pk, ct).ConfigureAwait(false);
@@ -415,6 +375,7 @@ internal sealed class DefaultTable<T> : ITable<T>
 
     public async IAsyncEnumerable<T> QueryAsync(Func<T, bool> predicate, IndexHint hint, int pageSize = 1024, ReadOnlyMemory<byte> token = default, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
+        // MVP: hint ignorowany – w przyszłości można dociąć zakres po indeksie
         await foreach (var it in QueryAsync(predicate, pageSize, token, ct))
             yield return it;
     }
@@ -426,5 +387,16 @@ internal sealed class DefaultTable<T> : ITable<T>
         for (int i = 0; i < a.Length; i++)
             if (a[i] != b[i]) return false;
         return true;
+    }
+
+    private static int ByteCompare(byte[] a, byte[] b)
+    {
+        int min = Math.Min(a.Length, b.Length);
+        for (int i = 0; i < min; i++)
+        {
+            int d = a[i] - b[i];
+            if (d != 0) return d;
+        }
+        return a.Length - b.Length;
     }
 }
