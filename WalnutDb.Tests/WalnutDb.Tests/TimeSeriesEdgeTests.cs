@@ -37,7 +37,11 @@ public sealed class TimeSeriesEdgeTests
         var wal = new WalWriter(Path.Combine(dir, "wal.log"));
         await using var db = new WalnutDatabase(dir, new DatabaseOptions(), new FileSystemManifestStore(dir), wal);
 
-        var ts = await db.OpenTimeSeriesAsync(new TimeSeriesOptions<TsPointEdge>());
+        var ts = await db.OpenTimeSeriesAsync(new TimeSeriesOptions<TsPointEdge>
+        {
+            GetSeriesId = p => p.SeriesId,
+            GetUtcTimestamp = p => p.Ts
+        });
 
         var baseUtc = new DateTime(2024, 01, 01, 12, 0, 0, DateTimeKind.Utc);
         await ts.AppendAsync(new TsPointEdge { SeriesId = "sA", Ts = baseUtc.AddMinutes(0), Value = 10 }); // 0m
@@ -66,7 +70,11 @@ public sealed class TimeSeriesEdgeTests
         var wal = new WalWriter(Path.Combine(dir, "wal.log"));
         await using var db = new WalnutDatabase(dir, new DatabaseOptions(), new FileSystemManifestStore(dir), wal);
 
-        var ts = await db.OpenTimeSeriesAsync(new TimeSeriesOptions<TsPointEdge>());
+        var ts = await db.OpenTimeSeriesAsync(new TimeSeriesOptions<TsPointEdge>
+        {
+            GetSeriesId = p => p.SeriesId,
+            GetUtcTimestamp = p => p.Ts
+        });
 
         var t = new DateTime(2024, 06, 01, 8, 0, 0, DateTimeKind.Utc);
         await ts.AppendAsync(new TsPointEdge { SeriesId = "sZ", Ts = t, Value = 1 });
@@ -86,7 +94,11 @@ public sealed class TimeSeriesEdgeTests
         var wal = new WalWriter(Path.Combine(dir, "wal.log"));
         await using var db = new WalnutDatabase(dir, new DatabaseOptions(), new FileSystemManifestStore(dir), wal);
 
-        var ts = await db.OpenTimeSeriesAsync(new TimeSeriesOptions<TsPointEdge>());
+        var ts = await db.OpenTimeSeriesAsync(new TimeSeriesOptions<TsPointEdge>
+        {
+            GetSeriesId = p => p.SeriesId,
+            GetUtcTimestamp = p => p.Ts
+        });
         var baseUtc = new DateTime(2024, 01, 01, 0, 0, 0, DateTimeKind.Utc);
 
         await ts.AppendAsync(new TsPointEdge { SeriesId = "sM", Ts = baseUtc.AddMinutes(0), Value = 1 });

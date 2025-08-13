@@ -32,6 +32,7 @@ public sealed class WalnutDatabase : IDatabase
 
         var recovered = new ConcurrentDictionary<string, MemTable>();
         WalRecovery.Replay(Path.Combine(_dir, "wal.log"), recovered);
+        
         foreach (var kv in recovered)
             _tables[kv.Key] = new MemTableRef(kv.Value);
 

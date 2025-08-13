@@ -1,52 +1,94 @@
 ﻿#nullable enable
-using System.Reflection;
+using System;
+using System.Buffers.Binary;
+using System.Text;
+using System.Text.Json;
 
 namespace WalnutDb.Core;
 
 internal sealed class TimeSeriesMapper<T>
 {
     private readonly Func<T, object> _getSeriesId;
-    private readonly Func<T, DateTime> _getTimestampUtc;
-    private readonly bool _guidStringsAsBinary;
+    private readonly Func<T, DateTime> _getUtc;
+    private readonly Func<T, byte[]> _serialize;
+    private readonly Func<ReadOnlyMemory<byte>, T> _deserialize;
+    private readonly JsonSerializerOptions _stj;
 
-    public TimeSeriesMapper(WalnutDb.TimeSeriesOptions<T> opt)
+    public TimeSeriesMapper(TimeSeriesOptions<T> opt)
     {
-        _guidStringsAsBinary = true;
-        _getSeriesId = opt.GetSeriesId ?? BuildSeriesFromAttr();
-        _getTimestampUtc = opt.GetTimestampUtc ?? BuildTimestampFromAttr();
+        _getSeriesId = opt.GetSeriesId ?? throw new ArgumentNullException(nameof(opt.GetSeriesId));
+        _getUtc = opt.GetUtcTimestamp ?? throw new ArgumentNullException(nameof(opt.GetUtcTimestamp));
+        _stj = opt.JsonOptions ?? new JsonSerializerOptions();
+
+        _serialize = opt.Serialize ?? (item => JsonSerializer.SerializeToUtf8Bytes(item, _stj));
+        _deserialize = opt.Deserialize ?? (buf =>
+        {
+            var val = JsonSerializer.Deserialize<T>(buf.Span, _stj);
+            if (val is null) throw new InvalidDataException($"Failed to deserialize {typeof(T).Name} from JSON.");
+            return val;
+        });
     }
 
-    public byte[] BuildKey(T sample)
-        => WalnutDb.TimeSeries.TimeSeriesKeyCodec.BuildKey(_getSeriesId(sample), _getTimestampUtc(sample), _guidStringsAsBinary);
+    public byte[] Serialize(T item) => _serialize(item);
+    public T Deserialize(ReadOnlyMemory<byte> bytes) => _deserialize(bytes);
+    public object GetSeriesId(T item) => _getSeriesId(item);
+    public DateTime GetUtc(T item) => _getUtc(item);
 
-    public (byte[] start, byte[] endExclusive) BuildRange(object seriesId, DateTime fromUtc, DateTime toUtc)
+    // --- KLUCZ TS ---
+    // Format klucza: [L: u16 BE][SeriesId (L bajtów)][TS: u64 BE] gdzie TS = (ticks ^ long.MinValue) jako u64 BE
+    public byte[] BuildKey(T item)
+        => ComposeKey(EncodeSeriesId(_getSeriesId(item)), NormalizeUtc(_getUtc(item)));
+
+    public (byte[] Start, byte[] EndExclusive) BuildRange(object seriesId, DateTime fromUtc, DateTime toUtc)
     {
-        var start = WalnutDb.TimeSeries.TimeSeriesKeyCodec.RangeStart(seriesId, fromUtc, _guidStringsAsBinary);
-        var endEx = WalnutDb.TimeSeries.TimeSeriesKeyCodec.RangeEndExclusive(seriesId, toUtc, _guidStringsAsBinary);
+        var sid = EncodeSeriesId(seriesId);
+        var fromN = NormalizeUtc(fromUtc);
+        var toN = NormalizeUtc(toUtc);
+
+        if (toN < fromN) (fromN, toN) = (toN, fromN); // zabezpieczenie
+
+        var start = ComposeKey(sid, fromN);
+        var endEx = ComposeKey(sid, toN); // półotwarty: [from, to)
+
         return (start, endEx);
     }
 
-    private static Func<T, object> BuildSeriesFromAttr()
+    private static DateTime NormalizeUtc(DateTime dt) =>
+        dt.Kind switch
+        {
+            DateTimeKind.Utc => dt,
+            DateTimeKind.Local => dt.ToUniversalTime(),
+            _ => DateTime.SpecifyKind(dt, DateTimeKind.Utc)
+        };
+
+    private static byte[] ComposeKey(ReadOnlySpan<byte> seriesId, DateTime utc)
     {
-        var p = typeof(T).GetProperties(BindingFlags.Instance | BindingFlags.Public)
-            .FirstOrDefault(x => x.GetCustomAttribute<WalnutDb.DatabaseObjectIdAttribute>() != null);
-        if (p == null)
-            throw new InvalidOperationException($"Type {typeof(T).FullName} requires GetSeriesId or [DatabaseObjectId] for TimeSeries.");
-        return (T obj) => p.GetValue(obj)!;
+        var ts = utc.Ticks;
+        ulong biased = unchecked((ulong)(ts ^ long.MinValue));
+
+        var key = new byte[2 + seriesId.Length + 8];
+        BinaryPrimitives.WriteUInt16BigEndian(key.AsSpan(0, 2), checked((ushort)seriesId.Length));
+        seriesId.CopyTo(key.AsSpan(2));
+        BinaryPrimitives.WriteUInt64BigEndian(key.AsSpan(2 + seriesId.Length, 8), biased);
+        return key;
     }
 
-    private static Func<T, DateTime> BuildTimestampFromAttr()
+    private static byte[] EncodeSeriesId(object id)
     {
-        var p = typeof(T).GetProperties(BindingFlags.Instance | BindingFlags.Public)
-            .FirstOrDefault(x => x.GetCustomAttribute<WalnutDb.TimeSeriesTimestampAttribute>() != null);
-        if (p == null)
-            throw new InvalidOperationException($"Type {typeof(T).FullName} requires GetTimestampUtc or [TimeSeriesTimestamp].");
-        if (p.PropertyType != typeof(DateTime))
-            throw new InvalidOperationException($"Property {p.Name} must be DateTime for [TimeSeriesTimestamp].");
-        return (T obj) =>
+        return id switch
         {
-            var dt = (DateTime)(p.GetValue(obj) ?? default(DateTime));
-            return dt.Kind == DateTimeKind.Utc ? dt : dt.ToUniversalTime();
+            byte[] b => b,
+            ReadOnlyMemory<byte> rom => rom.ToArray(),
+            Guid g => g.ToByteArray(),
+            string s => Encoding.UTF8.GetBytes(s),
+            int i => U32(unchecked((uint)(i ^ int.MinValue))),
+            long l => U64(unchecked((ulong)(l ^ long.MinValue))),
+            uint ui => U32(ui),
+            ulong ul => U64(ul),
+            _ => Encoding.UTF8.GetBytes(id.ToString() ?? string.Empty),
         };
+
+        static byte[] U32(uint v) { var b = new byte[4]; BinaryPrimitives.WriteUInt32BigEndian(b, v); return b; }
+        static byte[] U64(ulong v) { var b = new byte[8]; BinaryPrimitives.WriteUInt64BigEndian(b, v); return b; }
     }
 }

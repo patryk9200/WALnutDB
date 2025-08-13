@@ -28,7 +28,7 @@ public sealed class TimeSeriesRangeTests
         var ts = await db.OpenTimeSeriesAsync(new TimeSeriesOptions<TsDoc>
         {
             GetSeriesId = d => d.Id,
-            GetTimestampUtc = d => d.CreationTime,
+            GetUtcTimestamp = d => d.CreationTime,
             Serialize = d => System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(d),
             Deserialize = b => System.Text.Json.JsonSerializer.Deserialize<TsDoc>(b.Span)!,
         });

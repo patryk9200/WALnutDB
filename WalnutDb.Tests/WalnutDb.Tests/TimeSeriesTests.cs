@@ -44,7 +44,11 @@ public sealed class TimeSeriesTests
             manifest: new FileSystemManifestStore(dir),
             wal: wal);
 
-        var ts = await db.OpenTimeSeriesAsync(new TimeSeriesOptions<TsPoint>());
+        var ts = await db.OpenTimeSeriesAsync(new TimeSeriesOptions<TsPoint>
+        {
+            GetSeriesId = p => p.SeriesId,
+            GetUtcTimestamp = p => p.Ts
+        });
 
         var baseUtc = new DateTime(2024, 01, 01, 12, 0, 0, DateTimeKind.Utc);
         await ts.AppendAsync(new TsPoint { SeriesId = "s1", Ts = baseUtc.AddMinutes(0), Value = 10 });

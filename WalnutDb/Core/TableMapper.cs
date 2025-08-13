@@ -1,5 +1,4 @@
-﻿using System;
-using System.Linq;
+﻿#nullable enable
 using System.Reflection;
 using System.Text.Json;
 
@@ -10,60 +9,66 @@ internal sealed class TableMapper<T>
     private readonly Func<T, object> _getId;
     private readonly Func<T, byte[]> _serialize;
     private readonly Func<ReadOnlyMemory<byte>, T> _deserialize;
-    private readonly bool _storeGuidStringsAsBinary;
+    private readonly bool _storeGuidAsBinary;
+    private readonly JsonSerializerOptions _stj;
 
-    public TableMapper(WalnutDb.TableOptions<T> options)
+    public TableMapper(TableOptions<T> opt)
     {
-        _storeGuidStringsAsBinary = options.StoreGuidStringsAsBinary;
+        _storeGuidAsBinary = opt.StoreGuidStringsAsBinary;
+        _stj = opt.JsonOptions ?? new JsonSerializerOptions
+        {
+            PropertyNamingPolicy = null,
+            WriteIndented = false
+        };
 
-        _getId = options.GetId ?? BuildGetIdFromAttribute();
-        _serialize = options.Serialize ?? (obj => JsonSerializer.SerializeToUtf8Bytes(obj));
-        _deserialize = options.Deserialize ?? (mem => JsonSerializer.Deserialize<T>(mem.Span)!);
+        // --- ID resolver ---
+        if (opt.GetId is not null)
+        {
+            _getId = opt.GetId;
+        }
+        else
+        {
+            var prop = typeof(T).GetProperties(BindingFlags.Instance | BindingFlags.Public)
+                                .FirstOrDefault(p => p.GetCustomAttribute<DatabaseObjectIdAttribute>() is not null);
+            if (prop is null)
+                throw new InvalidOperationException($"No GetId provided and no [DatabaseObjectId] found on type {typeof(T).FullName}.");
+
+            _getId = (T obj) => prop.GetValue(obj)
+                        ?? throw new InvalidOperationException("[DatabaseObjectId] value is null.");
+        }
+
+        // --- Domyślny STJ lub delegaty użytkownika ---
+        _serialize = opt.Serialize ?? SerializeWithStj;
+        _deserialize = opt.Deserialize ?? DeserializeWithStj;
     }
 
-    public byte[] GetKeyBytes(T item)
-        => EncodeIdToBytes(_getId(item));
+    private byte[] SerializeWithStj(T item)
+        => JsonSerializer.SerializeToUtf8Bytes(item, _stj);
 
-    public byte[] EncodeIdToBytes(object id)
+    private T DeserializeWithStj(ReadOnlyMemory<byte> buf)
     {
-        switch (id)
-        {
-            case byte[] bin:
-                return bin;
-            case ReadOnlyMemory<byte> rom:
-                return rom.ToArray();
-            case string s:
-                if (_storeGuidStringsAsBinary && Guid.TryParse(s, out var g))
-                    return GuidToBytes(g);
-                return System.Text.Encoding.UTF8.GetBytes(s);
-            case Guid g2:
-                return GuidToBytes(g2);
-            default:
-                // fallback: ToString UTF-8
-                return System.Text.Encoding.UTF8.GetBytes(id.ToString()!);
-        }
+        var val = JsonSerializer.Deserialize<T>(buf.Span, _stj);
+        if (val is null) throw new InvalidDataException($"Failed to deserialize {typeof(T).Name} from JSON.");
+        return val;
     }
 
     public byte[] Serialize(T item) => _serialize(item);
-    public T Deserialize(ReadOnlyMemory<byte> raw) => _deserialize(raw);
+    public T Deserialize(ReadOnlyMemory<byte> bytes) => _deserialize(bytes);
 
-    private static byte[] GuidToBytes(Guid g)
+    public byte[] GetKeyBytes(T item) => EncodeIdToBytes(_getId(item));
+
+    public byte[] EncodeIdToBytes(object id)
     {
-        var buf = new byte[16];
-        g.TryWriteBytes(buf);
-        return buf;
-    }
-
-    private static Func<T, object> BuildGetIdFromAttribute()
-    {
-        var idProp = typeof(T)
-            .GetProperties(BindingFlags.Instance | BindingFlags.Public)
-            .FirstOrDefault(p => p.GetCustomAttribute<WalnutDb.DatabaseObjectIdAttribute>() != null);
-
-        if (idProp == null)
-            throw new InvalidOperationException($"Type {typeof(T).FullName} does not define [DatabaseObjectId] and no GetId was provided.");
-
-        // zbuduj delegat bez refleksji w runtime pętli
-        return (T obj) => idProp.GetValue(obj)!;
+        return id switch
+        {
+            byte[] b => b,
+            ReadOnlyMemory<byte> rom => rom.ToArray(),
+            Guid g => g.ToByteArray(),
+            string s when _storeGuidAsBinary && Guid.TryParse(s, out var g2) => g2.ToByteArray(),
+            string s => System.Text.Encoding.UTF8.GetBytes(s),
+            int i => BitConverter.GetBytes(unchecked((uint)(i ^ int.MinValue))),
+            long l => BitConverter.GetBytes(unchecked((ulong)(l ^ long.MinValue))),
+            _ => System.Text.Encoding.UTF8.GetBytes(id.ToString() ?? string.Empty)
+        };
     }
 }
