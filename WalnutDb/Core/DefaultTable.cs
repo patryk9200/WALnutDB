@@ -86,16 +86,17 @@ internal sealed class DefaultTable<T> : ITable<T>
     public ValueTask<bool> DeleteAsync(string id, CancellationToken ct = default)
         => DeleteAsync((object)id, ct);
 
-    // ---------------- Ręczne transakcje ----------------
     public ValueTask<bool> UpsertAsync(T item, ITransaction txHandle, CancellationToken ct = default)
     {
         if (txHandle is not WalnutTransaction tx)
             throw new InvalidOperationException("Unknown transaction type.");
 
         var key = _map.GetKeyBytes(item);
-        var val = _map.Serialize(item);
+        var val = _map.Serialize(item);                         // plaintext do MEM
+        var enc = _db.Encryption;
+        var walVal = enc is null ? val : enc.Encrypt(val, _name, key); // szyfr do WAL
 
-        // stary rekord z bieżącej memki (dla aktualizacji indeksów)
+        // stary rekord z MEM (dla aktualizacji indeksów i optymalizacji checku)
         bool hasOld = false;
         T old = default!;
         if (_memRef.Current.TryGet(key, out var rawOld) && rawOld is not null)
@@ -104,44 +105,65 @@ internal sealed class DefaultTable<T> : ITable<T>
             hasOld = true;
         }
 
-        // —— sprawdź indeksy unikalne —— //
+        // —— unikalność —— //
         foreach (var idx in _indexes)
         {
             if (!idx.Unique) continue;
 
             var newValObj = idx.Extract(item);
-            if (newValObj is null) continue; // NULL nie podlega unikalności (jak w SQL)
+            if (newValObj is null) continue; // NULL nie podlega unikalności
 
-            var prefix = IndexKeyCodec.Encode(newValObj, idx.DecimalScale);
-            var to = IndexKeyCodec.PrefixUpperBound(prefix);
-
-            // 1) Mem
-            foreach (var kv in idx.Mem.Current.SnapshotRange(prefix, to, afterKeyExclusive: null))
+            // jeśli to update tego samego wiersza i wartość indeksu się nie zmienia → OK
+            if (hasOld)
             {
-                if (kv.Value.Tombstone) continue;
-                var pk = IndexKeyCodec.ExtractPrimaryKey(kv.Key);
-                if (!ByteArrayEquals(pk, key))
-                    throw new InvalidOperationException($"Unique index '{idx.Name}' violation for value '{newValObj}'.");
+                var oldValObj = idx.Extract(old);
+                if (Equals(newValObj, oldValObj))
+                    goto AfterUniqueCheck;
+            }
+
+            var newPrefix = IndexKeyCodec.Encode(newValObj, idx.DecimalScale);
+            var newIdxKey = IndexKeyCodec.ComposeIndexEntryKey(newPrefix, key);
+            var to = IndexKeyCodec.PrefixUpperBound(newPrefix);
+
+            // 1) MEM: żywy wpis (dokładny) dla newIdxKey → to my, OK
+            foreach (var kv in idx.Mem.Current.SnapshotRange(newIdxKey, ExactUpperBound(newIdxKey), afterKeyExclusive: null))
+            {
+                if (!kv.Value.Tombstone) goto AfterUniqueCheck;
                 break;
             }
 
-            // 2) SST – ignoruj, jeśli mem-index ma tombstone na TEN sam composite key
-            foreach (var kv in _db.ScanSstRange(idx.IndexTableName, prefix, to))
+            // 2) SST: dokładny wpis dla newIdxKey → to my (po checkpoint) , OK
+            foreach (var kv in _db.ScanSstRange(idx.IndexTableName, newIdxKey, ExactUpperBound(newIdxKey)))
             {
-                if (HasMemTombstone(idx.Mem.Current, kv.Key))
-                    continue; // stary wpis z SST jest przykryty tombstonem w memce
-
-                var pk = IndexKeyCodec.ExtractPrimaryKey(kv.Key);
-                if (!ByteArrayEquals(pk, key))
-                    throw new InvalidOperationException($"Unique index '{idx.Name}' violation for value '{newValObj}'.");
-                break; // wystarczy pierwszy trafiony
+                goto AfterUniqueCheck;
             }
 
+            // 3) MEM: ktoś inny ma ten sam prefix? (pomijamy tombstony)
+            foreach (var kv in idx.Mem.Current.SnapshotRange(newPrefix, to, afterKeyExclusive: null))
+            {
+                if (kv.Value.Tombstone) continue;
+                var existingPk = IndexKeyCodec.ExtractPrimaryKey(kv.Key);
+                if (!ByteArrayEquals(existingPk, key))
+                    throw new InvalidOperationException($"Unique index '{idx.Name}' violation for value '{newValObj}'.");
+            }
+
+            // 4) SST: ktoś inny ma ten sam prefix?
+            //    —> zmaskuj wpisy przykryte tombstonem w MEM (po Delete przed kolejnym checkpointem)
+            foreach (var kv in _db.ScanSstRange(idx.IndexTableName, newPrefix, to))
+            {
+                if (HasMemTombstone(idx.Mem.Current, kv.Key)) continue; // przykryty przez MEM-delete
+
+                var existingPk = IndexKeyCodec.ExtractPrimaryKey(kv.Key);
+                if (!ByteArrayEquals(existingPk, key))
+                    throw new InvalidOperationException($"Unique index '{idx.Name}' violation for value '{newValObj}'.");
+            }
+
+        AfterUniqueCheck:;
         }
 
         // —— główny PUT —— //
-        tx.AddPut(_name, key, val);
-        tx.AddApply(() => _memRef.Current.Upsert(key, val));
+        tx.AddPut(_name, key, walVal);                       // do WAL idzie szyfr
+        tx.AddApply(() => _memRef.Current.Upsert(key, val)); // w MEM trzymamy plaintext
 
         // —— aktualizacja indeksów —— //
         foreach (var idx in _indexes)
@@ -158,7 +180,7 @@ internal sealed class DefaultTable<T> : ITable<T>
                 {
                     var oldIdxKey = IndexKeyCodec.ComposeIndexEntryKey(oldPrefix, key);
                     tx.AddDelete(idx.IndexTableName, oldIdxKey);
-                    tx.AddApply(() => idx.Mem.Current.Delete(oldIdxKey));
+                    tx.AddApply(() => idx.Mem.Current.Delete(oldIdxKey)); // tombstone w MEM
                 }
             }
 
@@ -255,11 +277,18 @@ internal sealed class DefaultTable<T> : ITable<T>
     public ValueTask<T?> GetAsync(object id, CancellationToken ct = default)
     {
         var key = _map.EncodeIdToBytes(id);
+
+        // Mem (plaintext)
         if (_memRef.Current.TryGet(key, out var raw) && raw is not null)
             return ValueTask.FromResult<T?>(_map.Deserialize(raw));
 
+        // SST (szyfrowane, jeśli Encryption != null)
         if (_db.TryGetFromSst(_name, key, out var fromSst) && fromSst is not null)
-            return ValueTask.FromResult<T?>(_map.Deserialize(fromSst));
+        {
+            var enc = _db.Encryption;
+            var payload = (enc is null) ? fromSst : enc.Decrypt(fromSst, _name, key);
+            return ValueTask.FromResult<T?>(_map.Deserialize(payload));
+        }
 
         return ValueTask.FromResult<T?>(default);
     }
@@ -270,7 +299,7 @@ internal sealed class DefaultTable<T> : ITable<T>
     public async ValueTask<T?> GetFirstAsync(Func<T, bool> predicate, CancellationToken ct = default)
     {
         await foreach (var item in GetAllAsync(ct: ct))
-            if (predicate(item)) 
+            if (predicate(item))
                 return item;
 
         return default;
@@ -301,7 +330,12 @@ internal sealed class DefaultTable<T> : ITable<T>
             yield return item;
     }
 
-    public async IAsyncEnumerable<T> ScanByKeyAsync(ReadOnlyMemory<byte> fromInclusive, ReadOnlyMemory<byte> toExclusive, int pageSize = 1024, ReadOnlyMemory<byte> token = default, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+    public async IAsyncEnumerable<T> ScanByKeyAsync(
+    ReadOnlyMemory<byte> fromInclusive,
+    ReadOnlyMemory<byte> toExclusive,
+    int pageSize = 1024,
+    ReadOnlyMemory<byte> token = default,
+    [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
         var from = fromInclusive.IsEmpty ? Array.Empty<byte>() : fromInclusive.ToArray();
         var to = toExclusive.IsEmpty ? Array.Empty<byte>() : toExclusive.ToArray();
@@ -315,6 +349,7 @@ internal sealed class DefaultTable<T> : ITable<T>
 
         int sent = 0;
         byte[]? lastKey = null;
+        var enc = _db.Encryption;
 
         while (hasMem || hasSst)
         {
@@ -330,7 +365,7 @@ internal sealed class DefaultTable<T> : ITable<T>
                 {
                     if (after is null || ByteCompare(rec.Key, after) > 0)
                     {
-                        yield return _map.Deserialize(rec.Value.Value);
+                        yield return _map.Deserialize(rec.Value.Value); // mem: plaintext
                         if (++sent >= pageSize) { sent = 0; await Task.Yield(); }
                     }
                     lastKey = rec.Key;
@@ -346,7 +381,8 @@ internal sealed class DefaultTable<T> : ITable<T>
 
                 if (after is null || ByteCompare(rec.Key, after) > 0)
                 {
-                    yield return _map.Deserialize(rec.Val);
+                    var payload = (enc is null) ? rec.Val : enc.Decrypt(rec.Val, _name, rec.Key);
+                    yield return _map.Deserialize(payload);            // sst: decrypt
                     if (++sent >= pageSize) { sent = 0; await Task.Yield(); }
                 }
             }

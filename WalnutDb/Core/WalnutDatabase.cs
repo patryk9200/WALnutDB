@@ -15,11 +15,12 @@ public sealed class WalnutDatabase : IDatabase
     private readonly IManifestStore _manifest;
     internal readonly IWalWriter Wal;
     private readonly string _sstDir;
-    private readonly ConcurrentDictionary<string, SstReader> _sst = new();
     private ulong _nextSeqNo = 1;
+    private readonly ITypeNameResolver _typeNames;
+    internal IEncryption? Encryption => _options.Encryption;
+    private readonly ConcurrentDictionary<string, SstReader> _sst = new();
     internal readonly SemaphoreSlim WriterLock = new(1, 1); // single-writer apply
     private readonly ConcurrentDictionary<string, MemTableRef> _tables = new();
-    private readonly ITypeNameResolver _typeNames;
     internal readonly ConcurrentDictionary<string, TableMetrics> _metrics = new();
 
     public WalnutDatabase(string directory, DatabaseOptions options, IManifestStore manifest, IWalWriter wal, ITypeNameResolver? typeResolver = null)
@@ -33,7 +34,7 @@ public sealed class WalnutDatabase : IDatabase
 
         var recovered = new ConcurrentDictionary<string, MemTable>();
         WalRecovery.Replay(Path.Combine(_dir, "wal.log"), recovered);
-        
+
         foreach (var kv in recovered)
             _tables[kv.Key] = new MemTableRef(kv.Value);
 
@@ -73,7 +74,12 @@ public sealed class WalnutDatabase : IDatabase
             covered.Add(sig); // klucz istnieje w snapshot'cie (żywy lub tombstone)
 
             if (!it.Value.Tombstone && it.Value.Value is not null)
-                list.Add((it.Key, it.Value.Value)); // tylko żywe do listy
+            {
+                var v = it.Value.Value;
+                var vOut = Encryption is null ? v : Encryption.Encrypt(v, name, it.Key);
+                list.Add((it.Key, vOut));
+            }
+
         }
 
         // 3) Dociągnij z SST te klucze, których nie nadpisała/nie usunęła oldMem
@@ -81,7 +87,10 @@ public sealed class WalnutDatabase : IDatabase
         {
             var sig = Convert.ToBase64String(k);
             if (!covered.Contains(sig))
-                list.Add((k, v));
+            {
+                var vOut = Encryption is null ? v : Encryption.Encrypt(v, name, k);
+                list.Add((k, vOut));
+            }
         }
 
         // 4) Posortuj i zapisz nowy SST
@@ -109,7 +118,6 @@ public sealed class WalnutDatabase : IDatabase
         await Wal.FlushAsync(ct).ConfigureAwait(false);
         await Wal.TruncateAsync(ct).ConfigureAwait(false);
     }
-
 
     internal MemTableRef GetOrAddMemRef(string name)
     => _tables.GetOrAdd(name, _ => new MemTableRef(new MemTable()));
@@ -161,8 +169,6 @@ public sealed class WalnutDatabase : IDatabase
 
     public async ValueTask CheckpointAsync(CancellationToken ct = default)
     {
-        // 1) Freeze & swap – w jednej sekcji krytycznej zamieniamy wszystkie memki,
-        //    zbierając snapshoty do zrzutu.
         var snapshot = new List<(string Name, MemTable Old)>(_tables.Count);
 
         await WriterLock.WaitAsync(ct).ConfigureAwait(false);
@@ -183,7 +189,8 @@ public sealed class WalnutDatabase : IDatabase
             WriterLock.Release();
         }
 
-        // 2) Zapis snapshotów do SST (bez blokady writerów)
+        var enc = Encryption; // może być null
+
         foreach (var (name, oldMem) in snapshot)
         {
             ct.ThrowIfCancellationRequested();
@@ -193,7 +200,12 @@ public sealed class WalnutDatabase : IDatabase
             foreach (var it in oldMem.SnapshotAll(afterKeyExclusive: null))
             {
                 if (!it.Value.Tombstone && it.Value.Value is not null)
-                    list.Add((it.Key, it.Value.Value));
+                {
+                    var v = it.Value.Value;
+                    // do SST zapisujemy ciphertext (jeśli włączone szyfrowanie)
+                    var vOut = enc is null ? v : enc.Encrypt(v, name, it.Key);
+                    list.Add((it.Key, vOut));
+                }
             }
             list.Sort(static (a, b) =>
             {
@@ -202,7 +214,6 @@ public sealed class WalnutDatabase : IDatabase
                 return a.Key.Length - b.Key.Length;
             });
 
-            // źródło async
             async IAsyncEnumerable<(byte[] Key, byte[] Val)> SortedAsync()
             {
                 foreach (var t in list) { yield return t; await Task.Yield(); }
@@ -214,24 +225,21 @@ public sealed class WalnutDatabase : IDatabase
 
             await SstWriter.WriteAsync(tmp, SortedAsync(), ct).ConfigureAwait(false);
 
-            // *** KLUCZOWE: zamknij starego readera, zanim podmienisz plik ***
+            // zamknij starego readera przed Replace
             if (_sst.TryRemove(name, out var oldReader))
             {
                 try { oldReader.Dispose(); } catch { /* ignore */ }
             }
 
-            // atomowa podmiana/utworzenie
             if (File.Exists(dst))
                 File.Replace(tmp, dst, destinationBackupFileName: null);
             else
                 File.Move(tmp, dst);
 
-            // wczytaj świeżego readera
             _sst[name] = new SstReader(dst);
-            // oldMem – do GC
+            // oldMem -> GC
         }
 
-        // 3) WAL: flush + truncate po wszystkim
         await Wal.FlushAsync(ct).ConfigureAwait(false);
         await Wal.TruncateAsync(ct).ConfigureAwait(false);
     }
@@ -370,7 +378,11 @@ public sealed class WalnutDatabase : IDatabase
             var live = new List<(byte[] Key, byte[] Val)>();
             foreach (var it in mem.SnapshotAll(afterKeyExclusive: null))
                 if (!it.Value.Tombstone && it.Value.Value is not null)
-                    live.Add((it.Key, it.Value.Value));
+                {
+                    var v = it.Value.Value;
+                    var vOut = Encryption is null ? v : Encryption.Encrypt(v, name, it.Key);
+                    live.Add((it.Key, vOut));
+                }
 
             // dołóż wszystko z aktualnego SST (jeśli klucz nie jest nadpisany przez Mem)
             if (_sst.TryGetValue(name, out var sst))
@@ -380,7 +392,11 @@ public sealed class WalnutDatabase : IDatabase
                     // jeśli Mem nie ma override, weź z SST
                     // (proste sprawdzenie – w małej bazie OK; dla większej można sortować/mergować)
                     bool overridden = mem.TryGet(it.Key, out var raw) && raw is not null;
-                    if (!overridden) live.Add((it.Key, it.Val));
+                    if (!overridden)
+                    {
+                        var vOut = Encryption is null ? it.Val : Encryption.Encrypt(it.Val, name, it.Key);
+                        live.Add((it.Key, vOut));
+                    }
                 }
             }
 
