@@ -4,9 +4,55 @@
     <TargetFramework>net8.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <GeneratePackageOnBuild>True</GeneratePackageOnBuild>
+    <PackageId>WALnutDB</PackageId>
+    <Title>WALnutDB</Title>
+    <Version>1.0.1</Version>
+    <Authors>Patryk Golus</Authors>
+    <Company />
+    <Description>WALnutDB is a simple, safe embedded database for .NET 8+. It’s built for devices with little RAM and slow flash (SD cards, eMMC). It uses Write-Ahead Logging (WAL) for power-loss durability, compacts data into sorted segment files (SST), and provides secondary indexes and time-series scans. Fully managed (no native deps), cross-platform, and async by default.
+
+Highlights
+
+Power-loss safety: WAL with per-frame CRC, truncation-tolerant replay.
+
+Async I/O everywhere: designed for slow media and small RAM.
+
+Document tables: pluggable serialization (e.g. System.Text.Json); GUIDs/strings/byte[] keys.
+
+Secondary indexes: range scans over string/bytes/ints/floats/decimal (with scale).
+
+Time-series mode: UTC-ordered keys, efficient range scans by time.
+
+Checkpoint &amp; SST: flush memtables to sorted segments, fast reads, WAL truncation.
+
+Cross-platform: Linux/Windows/macOS; file-per-table for fault isolation.
+
+No native dependencies: pure C# for easy deployment on IoT.
+
+Roadmap: online compaction/defrag stats &amp; swap, unique index enforcement, optional encryption-at-rest, richer query push-downs.</Description>
+    <Copyright>Patryk Golus</Copyright>
+    <PackageIcon>logo.jpg</PackageIcon>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
   </PropertyGroup>
   <ItemGroup>
     <InternalsVisibleTo Include="WalnutDb.Tests" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="..\logo.jpg">
+      <Pack>True</Pack>
+      <PackagePath>\</PackagePath>
+    </None>
+    <None Include="..\README.md">
+      <Pack>True</Pack>
+      <PackagePath>\</PackagePath>
+    </None>
+  </ItemGroup>
+  <ItemGroup>
+    <None Update=".\logo.png">
+      <Pack>True</Pack>
+      <PackagePath>.\</PackagePath>
+    </None>
   </ItemGroup>
 
 </Project>
