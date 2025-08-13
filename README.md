@@ -66,11 +66,11 @@ await using var db = new WalnutDatabase(
     wal: wal
 );
 
-// Open a table with custom (de)serialization
+// Open a table (default serializer is used unless you override it)
 var users = await db.OpenTableAsync(new TableOptions<User>
 {
-    GetId       = u => u.Id, // string / Guid / byte[] supported
-	// optional, you can set your own serializer or use default 
+    GetId = u => u.Id, // string / Guid / byte[] supported
+    // Optional custom serializer:
     //Serialize   = u => JsonSerializer.SerializeToUtf8Bytes(u),
     //Deserialize = b => JsonSerializer.Deserialize<User>(b.Span)!,
     StoreGuidStringsAsBinary = true // optional optimization
@@ -115,8 +115,8 @@ using System.Text.Json;
 using WalnutDb.Indexing;
 
 var products = await db.OpenTableAsync(new TableOptions<Product> {
-    GetId       = p => p.Id,
-	// optional, you can set your own serializer or use default 
+    GetId = p => p.Id,
+    // Optional custom serializer:
     //Serialize   = p => JsonSerializer.SerializeToUtf8Bytes(p),
     //Deserialize = b => JsonSerializer.Deserialize<Product>(b.Span)!
 });
@@ -135,10 +135,59 @@ await foreach (var p in products.ScanByIndexAsync("Price", from, to))
 
 // Range by string prefix (e.g., category "sensors")
 var start = IndexKeyCodec.Encode("sensors");
-var end   = IndexKeyCodec.Encode("sensors" + '\\uFFFF');
+var end   = IndexKeyCodec.PrefixUpperBound(start);
 
 await foreach (var p in products.ScanByIndexAsync("Category", start, end))
     Console.WriteLine($"{p.Id} {p.Category}");
+```
+
+---
+
+## Index hints
+
+You can steer scans using `IndexHint` factories. (Descending `Asc=false` is planned; current implementation returns ascending.)
+
+```csharp
+using WalnutDb.Indexing;
+
+// Price in [10.00, 20.00), ascending, skip first 5, take 10
+var hint = IndexHint.FromValues("Price", 10.00m, 20.00m, decimalScale: 2, asc: true, skip: 5, take: 10);
+await foreach (var p in products.QueryAsync(x => true, hint))
+    Console.WriteLine($"{p.Id} {p.Price:0.00}");
+
+// Prefix by category:
+var hint2 = IndexHint.FromPrefix("Category", "sensors");
+await foreach (var p in products.QueryAsync(_ => true, hint2))
+    Console.WriteLine($"{p.Id} {p.Category}");
+```
+
+---
+
+## Unique indexes
+
+Mark a property with `[DbIndex(Name, Unique = true)]`. `null` values do **not** participate in uniqueness (SQL-like behavior).
+
+```csharp
+public sealed class User
+{
+    [DatabaseObjectId] public string Id { get; set; } = "";
+    [DbIndex("Email", Unique = true)]
+    public string? Email { get; set; }
+}
+
+// Insert A with email X, then checkpoint
+await users.UpsertAsync(new User { Id = "A", Email = "x@example.com" });
+await db.CheckpointAsync();
+
+// Inserting B with the same email throws
+await Assert.ThrowsAsync<InvalidOperationException>(() =>
+    users.UpsertAsync(new User { Id = "B", Email = "x@example.com" }));
+
+// Deleting A releases the unique constraint immediately (in mem)
+// and after checkpoint (for SST-backed entries)
+await users.DeleteAsync("A");
+await db.CheckpointAsync();
+await users.UpsertAsync(new User { Id = "B", Email = "x@example.com" });
 ```
 
 ---
@@ -160,7 +209,7 @@ var ts = await db.OpenTimeSeriesAsync(new TimeSeriesOptions<SensorSample>
 {
     GetSeriesId     = s => s.DeviceId,
     GetUtcTimestamp = s => s.Utc,
-	// optional, you can set your own serializer or use default 
+    // Optional custom serializer:
     //Serialize       = s => JsonSerializer.SerializeToUtf8Bytes(s),
     //Deserialize     = b => JsonSerializer.Deserialize<SensorSample>(b.Span)!,
 });
@@ -179,6 +228,7 @@ await foreach (var s in ts.QueryAsync("dev-1", fromUtc, toUtc))
 ---
 
 ## Transactions
+
 Both automatic **(implicit)** and manual **(explicit)** transactions are supported.
 
 ```csharp
@@ -196,19 +246,20 @@ await using (var tx = await db.BeginTransactionAsync())
 
 ---
 
-### Encryption at rest
+## Encryption at rest
 
-WALnutDB can encrypt values at rest (WAL + SST) with AES-GCM. Keys and index keys remain plaintext for sortability.
+WALnutDB can encrypt values at rest (WAL + SST) with **AES-GCM(256)**. Keys and index keys remain plaintext for sortability.
 
-**What is encrypted:** table values written to WAL and SST.  
-**What is not encrypted:** primary keys, index keys (they include the index value), filenames/metadata.
-
+**Encrypted:** table values written to WAL and SST.  
+**Not encrypted:** primary keys, index keys (they include the index value), filenames/metadata.  
 **Threat model:** protects against offline reads of WAL/SST files. In-memory data is plaintext.
 
-**Usage:**
 ```csharp
-var key = Convert.FromHexString("00112233445566778899AABBCCDDEEFF00112233445566778899AABBCCDDEEFF");
+var dir = Path.Combine(Path.GetTempPath(), "walnut-enc");
 await using var wal = new WalWriter(Path.Combine(dir, "wal.log"));
+
+var key = Convert.FromHexString("00112233445566778899AABBCCDDEEFF00112233445566778899AABBCCDDEEFF");
+
 await using var db = new WalnutDatabase(
     dir,
     new DatabaseOptions { Encryption = new AesGcmEncryption(key) },
@@ -217,13 +268,17 @@ await using var db = new WalnutDatabase(
 
 var tbl = await db.OpenTableAsync(new TableOptions<MyDoc> { GetId = d => d.Id });
 await tbl.UpsertAsync(new MyDoc { Id = "x", Secret = "hello" });
+await db.CheckpointAsync(); // values written to SST are ciphertext
+```
+
+**Crash-recovery with encryption:** recovery verifies `crc32` and replays committed frames, decrypting values on the fly before applying them to memtables.
 
 ---
 
 ## Durability & Checkpoints
 
-- `await db.FlushAsync()` — fsync WAL (fast).
-- `await db.CheckpointAsync()` — flush memtables → SST and **truncate the WAL**.
+- `await db.FlushAsync()` — fsync WAL (fast).  
+- `await db.CheckpointAsync()` — flush memtables → SST and **truncate the WAL**.  
 - Recovery reads `wal.log`, verifies the CRC of each frame, replays **committed** transactions, and safely stops at a torn tail.
 
 For safe shutdown on embedded devices:
@@ -252,6 +307,52 @@ In this repo there is **BenchmarkDotNet** (`WalnutDb.Bench`). Run in **Release**
 ```bash
 dotnet run -c Release --project WalnutDb.Bench
 ```
+
+---
+
+## On-disk formats (v1)
+
+### WAL (v1)
+
+Stream of frames:
+
+```
+[len:U32_LE] [payload:len bytes] [crc32:U32_LE]
+```
+
+- `crc32` is computed over `payload` (polynomial `0xEDB88320`).
+- `payload` layout varies by op:
+  - `Begin`: `[op:1][txId:U64][seqNo:U64]`
+  - `Put`:   `[op:1][txId:U64][tlen:U16][klen:U32][vlen:U32][table:tlen][key:klen][value:vlen]`
+  - `Del`:   `[op:1][txId:U64][tlen:U16][klen:U32][table:tlen][key:klen]`
+  - `Commit`:`[op:1][txId:U64][opsCount:U32]` (reserved)
+- Replay stops on the first malformed or truncated frame (“crash tail”).
+- If **encryption** is enabled, **values** inside WAL frames are encrypted (AES‑GCM v1) with AAD=`[table|pk]`.
+
+### SST (v1)
+
+Flat sorted segment file:
+
+```
+Header:  "SSTv1\0\0\0"  (8 bytes)
+Records: repeated [klen:U32_LE][vlen:U32_LE][key:klen][value:vlen]
+Trailer: [count:U32_LE] (optional in future versions)
+```
+
+- Keys are sorted lexicographically; merges assume sorted input.
+- If **encryption** is enabled, **values** stored in SST are ciphertext (AES‑GCM v1, same AAD).
+
+### Filenames
+
+Each logical table name is encoded to a filesystem‑safe base64‑url (without padding) when stored on disk. Example: `orders` → `b3JkZXJz`.
+
+---
+
+## Notes & Limitations
+
+- `IndexHint.Asc=false` (descending scans) is planned; current implementation returns ascending.
+- Unique indexes: `null` value does not participate in uniqueness.
+- One SST per table in v1 (simple model suitable for embedded; background compaction will come later).
 
 ---
 

@@ -1,5 +1,6 @@
 ﻿#nullable enable
 using WalnutDb.Core;
+using WalnutDb.Indexing;
 using WalnutDb.Wal;
 
 namespace WalnutDb.Tests;

@@ -1,4 +1,6 @@
 ﻿#nullable enable
+using WalnutDb.Indexing;
+
 namespace WalnutDb;
 
 /// <summary>

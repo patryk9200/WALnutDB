@@ -389,14 +389,18 @@ internal sealed class DefaultTable<T> : ITable<T>
         }
     }
 
-    public async IAsyncEnumerable<T> ScanByIndexAsync(string indexName, ReadOnlyMemory<byte> start, ReadOnlyMemory<byte> end, int pageSize = 1024, ReadOnlyMemory<byte> token = default, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+    public async IAsyncEnumerable<T> ScanByIndexAsync(
+    IndexHint hint,
+    int pageSize = 1024,
+    ReadOnlyMemory<byte> token = default,
+    [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
-        var idx = _indexes.Find(i => string.Equals(i.Name, indexName, StringComparison.Ordinal));
+        var idx = _indexes.Find(i => string.Equals(i.Name, hint.IndexName, StringComparison.Ordinal));
         if (idx is null)
-            throw new ArgumentException($"Index '{indexName}' not found on table '{_name}'.", nameof(indexName));
+            throw new ArgumentException($"Index '{hint.IndexName}' not found on table '{_name}'.", nameof(hint));
 
-        var from = start.IsEmpty ? Array.Empty<byte>() : start.ToArray();
-        var to = end.IsEmpty ? Array.Empty<byte>() : end.ToArray();
+        var from = hint.Start.IsEmpty ? Array.Empty<byte>() : hint.Start.ToArray();
+        var to = hint.End.IsEmpty ? Array.Empty<byte>() : hint.End.ToArray();
         var after = token.IsEmpty ? null : token.ToArray();
 
         var memEnum = idx.Mem.Current.SnapshotRange(from, to, after).GetEnumerator();
@@ -408,6 +412,75 @@ internal sealed class DefaultTable<T> : ITable<T>
         int sent = 0;
         byte[]? lastKey = null;
 
+        // ——— tryb rosnący: push-down Skip/Take w locie ———
+        if (hint.Asc)
+        {
+            int skipped = 0;
+            int yielded = 0;
+            int? limit = hint.Take;
+
+            while (hasMem || hasSst)
+            {
+                ct.ThrowIfCancellationRequested();
+                bool useMem = hasMem && (!hasSst || ByteCompare(memEnum.Current.Key, sstEnum.Current.Key) <= 0);
+
+                if (useMem)
+                {
+                    var rec = memEnum.Current; hasMem = memEnum.MoveNext();
+                    if (!rec.Value.Tombstone)
+                    {
+                        var pk = IndexKeyCodec.ExtractPrimaryKey(rec.Key);
+                        if (after is null || ByteCompare(rec.Key, after) > 0)
+                        {
+                            var obj = await GetAsync((object)pk, ct).ConfigureAwait(false);
+                            if (obj is not null)
+                            {
+                                if (hint.Skip > 0 && skipped < hint.Skip) { skipped++; }
+                                else
+                                {
+                                    yield return obj;
+                                    yielded++;
+                                    if (++sent >= pageSize) { sent = 0; await Task.Yield(); }
+                                    if (limit is int l && yielded >= l) yield break;
+                                }
+                            }
+                        }
+                        lastKey = rec.Key;
+                    }
+                    if (hasSst && lastKey is not null && ByteCompare(lastKey, sstEnum.Current.Key) == 0)
+                        hasSst = sstEnum.MoveNext();
+                }
+                else
+                {
+                    var rec = sstEnum.Current; hasSst = sstEnum.MoveNext();
+                    if (HasMemTombstone(idx.Mem.Current, rec.Key)) continue;
+
+                    var pk = IndexKeyCodec.ExtractPrimaryKey(rec.Key);
+                    if (after is null || ByteCompare(rec.Key, after) > 0)
+                    {
+                        var obj = await GetAsync((object)pk, ct).ConfigureAwait(false);
+                        if (obj is not null)
+                        {
+                            if (hint.Skip > 0 && skipped < hint.Skip) { skipped++; }
+                            else
+                            {
+                                yield return obj;
+                                yielded++;
+                                if (++sent >= pageSize) { sent = 0; await Task.Yield(); }
+                                if (limit is int l && yielded >= l) yield break;
+                            }
+                        }
+                    }
+                }
+            }
+            yield break;
+        }
+
+        // ——— tryb malejący: bufor „ostatnich K” i odwrócenie ———
+        // K = Skip + Take (jeśli Take brak → buforujemy cały zakres)
+        var cap = hint.Take is int t ? (hint.Skip + t) : int.MaxValue;
+        var ring = new LinkedList<T>(); // prosty pierścień
+
         while (hasMem || hasSst)
         {
             ct.ThrowIfCancellationRequested();
@@ -415,36 +488,28 @@ internal sealed class DefaultTable<T> : ITable<T>
 
             if (useMem)
             {
-                var rec = memEnum.Current;
-                hasMem = memEnum.MoveNext();
-
+                var rec = memEnum.Current; hasMem = memEnum.MoveNext();
                 if (!rec.Value.Tombstone)
                 {
-                    var composite = rec.Key;
-                    var pk = IndexKeyCodec.ExtractPrimaryKey(composite);
-                    if (after is null || ByteCompare(composite, after) > 0)
+                    var pk = IndexKeyCodec.ExtractPrimaryKey(rec.Key);
+                    if (after is null || ByteCompare(rec.Key, after) > 0)
                     {
                         var obj = await GetAsync((object)pk, ct).ConfigureAwait(false);
                         if (obj is not null)
                         {
-                            yield return obj;
-                            if (++sent >= pageSize) { sent = 0; await Task.Yield(); }
+                            ring.AddLast(obj);
+                            if (ring.Count > cap) ring.RemoveFirst();
                         }
                     }
-                    lastKey = composite;
+                    lastKey = rec.Key;
                 }
-
                 if (hasSst && lastKey is not null && ByteCompare(lastKey, sstEnum.Current.Key) == 0)
                     hasSst = sstEnum.MoveNext();
             }
             else
             {
-                var rec = sstEnum.Current;
-                hasSst = sstEnum.MoveNext();
-
-                // ← NOWE: jeżeli mem-index ma tombstone dla tego compositeKey, zignoruj wpis z SST
-                if (HasMemTombstone(idx.Mem.Current, rec.Key))
-                    continue;
+                var rec = sstEnum.Current; hasSst = sstEnum.MoveNext();
+                if (HasMemTombstone(idx.Mem.Current, rec.Key)) continue;
 
                 var pk = IndexKeyCodec.ExtractPrimaryKey(rec.Key);
                 if (after is null || ByteCompare(rec.Key, after) > 0)
@@ -452,12 +517,37 @@ internal sealed class DefaultTable<T> : ITable<T>
                     var obj = await GetAsync((object)pk, ct).ConfigureAwait(false);
                     if (obj is not null)
                     {
-                        yield return obj;
-                        if (++sent >= pageSize) { sent = 0; await Task.Yield(); }
+                        ring.AddLast(obj);
+                        if (ring.Count > cap) ring.RemoveFirst();
                     }
                 }
             }
         }
+
+        // yield w odwrotnej kolejności, z pominięciem 'Skip' i ograniczeniem 'Take'
+        var arr = ring.ToArray(); // ascending końcówka
+        int startIndex = arr.Length - 1 - hint.Skip; // pierwszy do zwrócenia w DESC
+        int remaining = hint.Take ?? int.MaxValue;
+
+        for (int i = startIndex; i >= 0 && remaining > 0; i--)
+        {
+            yield return arr[i];
+            remaining--;
+            if (++sent >= pageSize) { sent = 0; await Task.Yield(); }
+        }
+    }
+
+    public async IAsyncEnumerable<T> ScanByIndexAsync(
+    string indexName,
+    ReadOnlyMemory<byte> start,
+    ReadOnlyMemory<byte> end,
+    int pageSize = 1024,
+    ReadOnlyMemory<byte> token = default,
+    [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+    {
+        var hint = new IndexHint(indexName, start, end, Asc: true, Skip: 0, Take: null);
+        await foreach (var x in ScanByIndexAsync(hint, pageSize, token, ct))
+            yield return x;
     }
 
     public async IAsyncEnumerable<T> QueryAsync(Func<T, bool> predicate, int pageSize = 1024, ReadOnlyMemory<byte> token = default, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
@@ -483,32 +573,27 @@ internal sealed class DefaultTable<T> : ITable<T>
         var idx = _indexes.Find(i => string.Equals(i.Name, hint.IndexName, StringComparison.Ordinal));
         if (idx is null)
         {
-            // fallback bez indeksu
             await foreach (var it in QueryAsync(predicate, pageSize, token, ct))
                 yield return it;
             yield break;
         }
 
-        var start = hint.Start.IsEmpty ? ReadOnlyMemory<byte>.Empty : hint.Start;
-        var end = hint.End.IsEmpty ? ReadOnlyMemory<byte>.Empty : hint.End;
+        // skanuj z tym samym zakresem/porządkiem, ale BEZ Skip/Take (bo mamy predicate)
+        var scanHint = hint with { Skip = 0, Take = null };
 
-        int skipped = 0;
-        int yielded = 0;
+        int skipped = 0, yielded = 0;
         int? limit = hint.Take;
 
-        // Uwaga: na razie Asc=false ignorujemy (zwracamy rosnąco)
-        await foreach (var item in ScanByIndexAsync(idx.Name, start, end, pageSize, token, ct))
+        await foreach (var item in ScanByIndexAsync(scanHint, pageSize, token, ct))
         {
-            if (hint.Skip > 0 && skipped < hint.Skip) { skipped++; continue; }
             if (!predicate(item)) continue;
+            if (hint.Skip > 0 && skipped < hint.Skip) { skipped++; continue; }
 
             yield return item;
             yielded++;
             if (limit is int l && yielded >= l) yield break;
         }
     }
-
-
 
     // ---------------- Helpers ----------------
     // Zwraca górną granicę (exclusive) dla "dokładnie tego" klucza.
