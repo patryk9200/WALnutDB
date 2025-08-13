@@ -17,12 +17,6 @@ public sealed record IndexPart(string Property, IndexType Type, bool Desc = fals
 public sealed record IndexDescriptor(string Name, IReadOnlyList<IndexPart> Parts, bool Unique = false);
 
 /// <summary>
-/// Wskazówka dla zapytań: nazwa indeksu oraz granice zakresu (start włącznie, koniec wyłącznie).
-/// Umożliwia pushdown zakresu przy Query/GetFirst.
-/// </summary>
-public sealed record IndexHint(string IndexName, ReadOnlyMemory<byte> StartInclusive, ReadOnlyMemory<byte> EndExclusive);
-
-/// <summary>
 /// Opcje tabeli. Pozwalają zdefiniować mapowanie klucza i serializację bez refleksji.
 /// </summary>
 public sealed class TableOptions<T>

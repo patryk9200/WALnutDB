@@ -95,7 +95,7 @@ internal sealed class DefaultTable<T> : ITable<T>
         var key = _map.GetKeyBytes(item);
         var val = _map.Serialize(item);
 
-        // stary rekord (jeśli mamy go w bieżącej memce) — potrzebny do aktualizacji indeksów
+        // stary rekord z bieżącej memki (dla aktualizacji indeksów)
         bool hasOld = false;
         T old = default!;
         if (_memRef.Current.TryGet(key, out var rawOld) && rawOld is not null)
@@ -104,11 +104,41 @@ internal sealed class DefaultTable<T> : ITable<T>
             hasOld = true;
         }
 
-        // główny PUT
+        // —— sprawdź indeksy unikalne —— //
+        foreach (var idx in _indexes)
+        {
+            if (!idx.Unique) continue;
+
+            var newValObj = idx.Extract(item);
+            // Konwencja: NULL nie łapie unikalności (jak w SQL) – pomijamy sprawdzanie
+            if (newValObj is null) continue;
+
+            var prefix = IndexKeyCodec.Encode(newValObj, idx.DecimalScale);
+            var to = IndexKeyCodec.NextPrefix(prefix) ?? Array.Empty<byte>();
+
+            // 1) Mem (snapshot, bez awaitów)
+            foreach (var kv in idx.Mem.Current.SnapshotRange(prefix, to, afterKeyExclusive: null))
+            {
+                if (kv.Value.Tombstone) continue;
+                var pk = IndexKeyCodec.ExtractPrimaryKey(kv.Key);
+                if (!ByteArrayEquals(pk, key))
+                    throw new InvalidOperationException($"Unique index '{idx.Name}' violation for value '{newValObj}'.");
+            }
+
+            // 2) SST
+            foreach (var kv in _db.ScanSstRange(idx.IndexTableName, prefix, to))
+            {
+                var pk = IndexKeyCodec.ExtractPrimaryKey(kv.Key);
+                if (!ByteArrayEquals(pk, key))
+                    throw new InvalidOperationException($"Unique index '{idx.Name}' violation for value '{newValObj}'.");
+            }
+        }
+
+        // —— główny PUT —— //
         tx.AddPut(_name, key, val);
         tx.AddApply(() => _memRef.Current.Upsert(key, val));
 
-        // indeksy (pojedyncze pola)
+        // —— aktualizacja indeksów —— //
         foreach (var idx in _indexes)
         {
             var newValObj = idx.Extract(item);
@@ -222,12 +252,26 @@ internal sealed class DefaultTable<T> : ITable<T>
     public async ValueTask<T?> GetFirstAsync(Func<T, bool> predicate, CancellationToken ct = default)
     {
         await foreach (var item in GetAllAsync(ct: ct))
-            if (predicate(item)) return item;
+            if (predicate(item)) 
+                return item;
+
         return default;
     }
 
-    public ValueTask<T?> GetFirstAsync(Func<T, bool> predicate, IndexHint hint, CancellationToken ct = default)
-        => GetFirstAsync(predicate, ct); // MVP: hint ignorowany
+    public async ValueTask<T?> GetFirstAsync(Func<T, bool> predicate, IndexHint hint, CancellationToken ct = default)
+    {
+        var idx = _indexes.Find(i => string.Equals(i.Name, hint.IndexName, StringComparison.Ordinal));
+        if (idx is null)
+            return await GetFirstAsync(predicate, ct).ConfigureAwait(false); // fallback
+
+        var start = hint.Start.IsEmpty ? ReadOnlyMemory<byte>.Empty : hint.Start;
+        var end = hint.End.IsEmpty ? ReadOnlyMemory<byte>.Empty : hint.End;
+
+        await foreach (var item in ScanByIndexAsync(idx.Name, start, end, 1024, default, ct))
+            if (predicate(item)) return item;
+
+        return default;
+    }
 
     public async IAsyncEnumerable<T> GetAllAsync(
     int pageSize = 1024,
@@ -375,10 +419,28 @@ internal sealed class DefaultTable<T> : ITable<T>
 
     public async IAsyncEnumerable<T> QueryAsync(Func<T, bool> predicate, IndexHint hint, int pageSize = 1024, ReadOnlyMemory<byte> token = default, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
-        // MVP: hint ignorowany – w przyszłości można dociąć zakres po indeksie
-        await foreach (var it in QueryAsync(predicate, pageSize, token, ct))
-            yield return it;
+        var idx = _indexes.Find(i => string.Equals(i.Name, hint.IndexName, StringComparison.Ordinal));
+        if (idx is null)
+        {
+            await foreach (var it in QueryAsync(predicate, pageSize, token, ct))
+                yield return it;
+            yield break;
+        }
+
+        var start = hint.Start.IsEmpty ? ReadOnlyMemory<byte>.Empty : hint.Start;
+        var end = hint.End.IsEmpty ? ReadOnlyMemory<byte>.Empty : hint.End;
+
+        int sent = 0;
+        await foreach (var item in ScanByIndexAsync(idx.Name, start, end, pageSize, token, ct))
+        {
+            if (predicate(item))
+            {
+                yield return item;
+                if (++sent >= pageSize) { sent = 0; await Task.Yield(); }
+            }
+        }
     }
+
 
     // ---------------- Helpers ----------------
     private static bool ByteArrayEquals(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b)

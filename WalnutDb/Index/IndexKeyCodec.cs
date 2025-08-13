@@ -142,4 +142,21 @@ static class IndexKeyCodec
         g.TryWriteBytes(buf);
         return buf;
     }
+    public static byte[]? NextPrefix(ReadOnlySpan<byte> prefix)
+    {
+        if (prefix.Length == 0) return Array.Empty<byte>(); // „> cokolwiek” – więc brak prefiksu => unbounded
+        var buf = prefix.ToArray();
+        for (int i = buf.Length - 1; i >= 0; i--)
+        {
+            if (buf[i] != 0xFF)
+            {
+                buf[i]++;
+                if (i < buf.Length - 1) Array.Resize(ref buf, i + 1);
+                return buf;
+            }
+        }
+        // wszystkie FF – nie istnieje ścisła kolejna wartość prefiksu; potraktuj jako „brak górnej granicy”
+        return null;
+    }
+
 }
