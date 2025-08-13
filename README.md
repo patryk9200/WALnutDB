@@ -70,8 +70,9 @@ await using var db = new WalnutDatabase(
 var users = await db.OpenTableAsync(new TableOptions<User>
 {
     GetId       = u => u.Id, // string / Guid / byte[] supported
-    Serialize   = u => JsonSerializer.SerializeToUtf8Bytes(u),
-    Deserialize = b => JsonSerializer.Deserialize<User>(b.Span)!,
+	// optional, you can set your own serializer or use default 
+    //Serialize   = u => JsonSerializer.SerializeToUtf8Bytes(u),
+    //Deserialize = b => JsonSerializer.Deserialize<User>(b.Span)!,
     StoreGuidStringsAsBinary = true // optional optimization
 });
 
@@ -115,8 +116,9 @@ using WalnutDb.Indexing;
 
 var products = await db.OpenTableAsync(new TableOptions<Product> {
     GetId       = p => p.Id,
-    Serialize   = p => JsonSerializer.SerializeToUtf8Bytes(p),
-    Deserialize = b => JsonSerializer.Deserialize<Product>(b.Span)!
+	// optional, you can set your own serializer or use default 
+    //Serialize   = p => JsonSerializer.SerializeToUtf8Bytes(p),
+    //Deserialize = b => JsonSerializer.Deserialize<Product>(b.Span)!
 });
 
 // Insert a few
@@ -158,8 +160,9 @@ var ts = await db.OpenTimeSeriesAsync(new TimeSeriesOptions<SensorSample>
 {
     GetSeriesId     = s => s.DeviceId,
     GetUtcTimestamp = s => s.Utc,
-    Serialize       = s => JsonSerializer.SerializeToUtf8Bytes(s),
-    Deserialize     = b => JsonSerializer.Deserialize<SensorSample>(b.Span)!,
+	// optional, you can set your own serializer or use default 
+    //Serialize       = s => JsonSerializer.SerializeToUtf8Bytes(s),
+    //Deserialize     = b => JsonSerializer.Deserialize<SensorSample>(b.Span)!,
 });
 
 // Append
