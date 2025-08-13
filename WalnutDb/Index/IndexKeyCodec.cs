@@ -5,7 +5,7 @@ using System.Text;
 
 namespace WalnutDb.Indexing;
 
-static class IndexKeyCodec
+public static class IndexKeyCodec
 {
     public static byte[] Encode(object? value, int? decimalScale = null)
     {

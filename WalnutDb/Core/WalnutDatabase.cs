@@ -96,26 +96,36 @@ public sealed class WalnutDatabase : IDatabase
 
     public async ValueTask CheckpointAsync(CancellationToken ct = default)
     {
-        // 1) Freeze & swap – podmień wszystkie memki na nowe
+        // 1) Freeze & swap – w jednej sekcji krytycznej zamieniamy wszystkie memki,
+        //    zbierając snapshoty do zrzutu.
         var snapshot = new List<(string Name, MemTable Old)>(_tables.Count);
-        foreach (var kv in _tables.ToArray())
+
+        await WriterLock.WaitAsync(ct).ConfigureAwait(false);
+        try
         {
-            ct.ThrowIfCancellationRequested();
-            var name = kv.Key;
-            var refm = kv.Value;
+            foreach (var kv in _tables.ToArray())
+            {
+                ct.ThrowIfCancellationRequested();
+                var name = kv.Key;
+                var refm = kv.Value;
 
-            var old = refm.Current;
-            var fresh = new MemTable();
-            refm.Current = fresh;            // nowe inserty lecą już tutaj
-
-            snapshot.Add((name, old));       // tę starą zrzucimy do SST
+                var old = refm.Swap(new MemTable()); // <<— JEDYNY poprawny sposób podmiany
+                snapshot.Add((name, old));           // tę starą zrzucimy do SST
+            }
+        }
+        finally
+        {
+            WriterLock.Release();
         }
 
-        // 2) Zapis snapshotów do SST
+        // 2) Zapis snapshotów do SST (już bez blokowania writerów)
         foreach (var (name, oldMem) in snapshot)
         {
+            ct.ThrowIfCancellationRequested();
+
+            // zbierz live wpisy i posortuj leksykograficznie po kluczu
             var list = new List<(byte[] Key, byte[] Val)>();
-            foreach (var it in oldMem.SnapshotAll(null))
+            foreach (var it in oldMem.SnapshotAll(afterKeyExclusive: null))
             {
                 if (!it.Value.Tombstone && it.Value.Value is not null)
                     list.Add((it.Key, it.Value.Value));
@@ -127,6 +137,7 @@ public sealed class WalnutDatabase : IDatabase
                 return a.Key.Length - b.Key.Length;
             });
 
+            // asynchroniczne źródło (bez Span przez await/yield)
             async IAsyncEnumerable<(byte[] Key, byte[] Val)> SortedAsync()
             {
                 foreach (var t in list) { yield return t; await Task.Yield(); }
@@ -137,11 +148,14 @@ public sealed class WalnutDatabase : IDatabase
             var dst = Path.Combine(_sstDir, $"{safe}.sst");
 
             await SstWriter.WriteAsync(tmp, SortedAsync(), ct).ConfigureAwait(false);
-            if (File.Exists(dst)) File.Replace(tmp, dst, destinationBackupFileName: null);
-            else File.Move(tmp, dst);
+
+            if (File.Exists(dst))
+                File.Replace(tmp, dst, destinationBackupFileName: null);
+            else
+                File.Move(tmp, dst);
 
             ReplaceSst(name, dst);
-            // oldMem wyleci z GC
+            // oldMem leci do GC
         }
 
         // 3) WAL: jeden flush + truncate po wszystkim
@@ -150,26 +164,206 @@ public sealed class WalnutDatabase : IDatabase
     }
 
     // ---------- IDatabase ----------
+    // src/WalnutDb/Core/WalnutDatabase.cs  (TYLKO TREŚCI 3 METOD)
 
     public ValueTask<DbStats> GetStatsAsync(CancellationToken ct = default)
     {
-        // MVP: tylko rozmiar WAL + count memtable; uzupełnimy przy SST
-        long walBytes = 0;
-        long total = walBytes;
+        // WAL
+        var walPath = Path.Combine(_dir, "wal.log");
+        long walBytes = File.Exists(walPath) ? new FileInfo(walPath).Length : 0;
+
+        // zbuduj zbiór logicznych nazw tabel (z Mem i z SST)
+        var names = new HashSet<string>(_tables.Keys);
+        foreach (var n in _sst.Keys) names.Add(n);
+
+        long totalLive = 0;
+        long totalDead = 0;
         var tables = new List<TableStats>();
-        foreach (var kv in _tables)
+
+        foreach (var name in names)
         {
-            tables.Add(new TableStats(kv.Key, TotalBytes: 0, LiveBytes: 0, DeadBytes: 0, SstCount: 0, FragmentationPercent: 0));
+            ct.ThrowIfCancellationRequested();
+
+            long live = 0;
+            long dead = 0;
+            int sstCount = 0;
+            long sstSizeBytes = 0;
+
+            // Mem: policz live/dead (po prostu liczymy bajty Value; klucze pomijamy)
+            if (_tables.TryGetValue(name, out var memRef))
+            {
+                foreach (var kv in memRef.Current.SnapshotAll(afterKeyExclusive: null))
+                {
+                    if (kv.Value.Tombstone) dead++;
+                    else if (kv.Value.Value is not null) live += kv.Value.Value.LongLength;
+                }
+            }
+
+            // SST: policz live (cały plik skanujemy – MVP)
+            if (_sst.TryGetValue(name, out var sst))
+            {
+                sstCount = 1;
+                try { sstSizeBytes = new FileInfo(sst.Path).Length; } catch { /* ignore */ }
+                // policz Value bajty
+                foreach (var kv in sst.ScanRange(Array.Empty<byte>(), Array.Empty<byte>()))
+                    live += kv.Val.LongLength;
+            }
+
+            totalLive += live;
+            totalDead += dead;
+
+            double frag = (live + dead) > 0 ? (double)dead / (live + dead) * 100.0 : 0.0;
+            tables.Add(new TableStats(name,
+                TotalBytes: sstSizeBytes + live, // w Total liczymy rozmiar SST + żywe w mem (MVP)
+                LiveBytes: live,
+                DeadBytes: dead,
+                SstCount: sstCount,
+                FragmentationPercent: frag));
         }
-        var stats = new DbStats(total, walBytes, 0, 0, 0, tables);
+
+        long total = walBytes;
+        foreach (var t in tables) total += t.TotalBytes;
+
+        double totalFrag = (totalLive + totalDead) > 0 ? (double)totalDead / (totalLive + totalDead) * 100.0 : 0.0;
+        var stats = new DbStats(total, walBytes, totalLive, totalDead, totalFrag, tables);
         return ValueTask.FromResult(stats);
     }
 
-    public ValueTask<BackupResult> CreateBackupAsync(string targetDir, CancellationToken ct = default)
-        => ValueTask.FromResult(new BackupResult(targetDir, 0)); // TODO przy SST
+    public async ValueTask<BackupResult> CreateBackupAsync(string targetDir, CancellationToken ct = default)
+    {
+        Directory.CreateDirectory(targetDir);
+        var targetSstDir = Path.Combine(targetDir, "sst");
+        Directory.CreateDirectory(targetSstDir);
 
-    public ValueTask DefragmentAsync(DefragMode mode, CancellationToken ct = default)
-        => ValueTask.CompletedTask; // TODO przy SST
+        // 1) Zrób nsync WAL (z gwarancją spójności ramek do tego punktu)
+        await Wal.FlushAsync(ct).ConfigureAwait(false);
+
+        long copied = 0;
+
+        // 2) Skopiuj wszystkie *.sst (snapshot listy; kopiuj z Share Read/Write)
+        foreach (var file in Directory.EnumerateFiles(_sstDir, "*.sst"))
+        {
+            ct.ThrowIfCancellationRequested();
+            var dst = Path.Combine(targetSstDir, Path.GetFileName(file));
+            using (var src = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            using (var dstFs = new FileStream(dst, FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+                await src.CopyToAsync(dstFs, ct).ConfigureAwait(false);
+                copied += dstFs.Length;
+            }
+        }
+
+        // 3) Skopiuj WAL (wal.log)
+        var walPath = Path.Combine(_dir, "wal.log");
+        if (File.Exists(walPath))
+        {
+            var dst = Path.Combine(targetDir, "wal.log");
+            using (var src = new FileStream(walPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            using (var dstFs = new FileStream(dst, FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+                await src.CopyToAsync(dstFs, ct).ConfigureAwait(false);
+                copied += dstFs.Length;
+            }
+        }
+
+        // (opcjonalnie) meta/manifest – jeśli masz pliki manifestu, przekopiuj je też
+        foreach (var mf in Directory.EnumerateFiles(_dir, "*.manifest"))
+        {
+            var dst = Path.Combine(targetDir, Path.GetFileName(mf));
+            File.Copy(mf, dst, overwrite: true);
+            copied += new FileInfo(mf).Length;
+        }
+
+        return new BackupResult(targetDir, copied);
+    }
+
+    public async ValueTask DefragmentAsync(DefragMode mode, CancellationToken ct = default)
+    {
+        // MVP: „defragmentacja” == pełny rebuild SST z aktualnego widoku + opróżnienie Mem (swap),
+        //       a potem truncate WAL. Wymaga chwilowego single-writera na czas swapu memek.
+        //       Działa identycznie dla Compact i RebuildSwap w tym modelu 1-SST-na-tabelę.
+
+        // 1) Zbuduj świeże SST z live view (Mem ∪ SST)
+        foreach (var kv in _tables.ToArray())
+        {
+            ct.ThrowIfCancellationRequested();
+            var name = kv.Key;
+
+            // poskładamy pełny widok jako async-enum (merge zrobi DefaultTable.ScanByKeyAsync,
+            // ale tu zrobimy lokalnie: Mem.Current + SST -> lista posortowana)
+            var mem = kv.Value.Current;
+
+            // zbierz live wpisy z Mem
+            var live = new List<(byte[] Key, byte[] Val)>();
+            foreach (var it in mem.SnapshotAll(afterKeyExclusive: null))
+                if (!it.Value.Tombstone && it.Value.Value is not null)
+                    live.Add((it.Key, it.Value.Value));
+
+            // dołóż wszystko z aktualnego SST (jeśli klucz nie jest nadpisany przez Mem)
+            if (_sst.TryGetValue(name, out var sst))
+            {
+                foreach (var it in sst.ScanRange(Array.Empty<byte>(), Array.Empty<byte>()))
+                {
+                    // jeśli Mem nie ma override, weź z SST
+                    // (proste sprawdzenie – w małej bazie OK; dla większej można sortować/mergować)
+                    bool overridden = mem.TryGet(it.Key, out var raw) && raw is not null;
+                    if (!overridden) live.Add((it.Key, it.Val));
+                }
+            }
+
+            // posortuj po kluczu
+            live.Sort(static (a, b) =>
+            {
+                int min = Math.Min(a.Key.Length, b.Key.Length);
+                for (int i = 0; i < min; i++)
+                {
+                    int d = a.Key[i] - b.Key[i];
+                    if (d != 0) return d;
+                }
+                return a.Key.Length - b.Key.Length;
+            });
+
+            // asynchroniczne źródło
+            async IAsyncEnumerable<(byte[] Key, byte[] Val)> AllAsync()
+            {
+                foreach (var t in live) { yield return t; await Task.Yield(); }
+            }
+
+            var safe = EncodeNameToFile(name);
+            var tmp = Path.Combine(_sstDir, $"{safe}.sst.tmp");
+            var dst = Path.Combine(_sstDir, $"{safe}.sst");
+
+            await SstWriter.WriteAsync(tmp, AllAsync(), ct).ConfigureAwait(false);
+
+            if (File.Exists(dst))
+                File.Replace(tmp, dst, destinationBackupFileName: null);
+            else
+                File.Move(tmp, dst);
+
+            ReplaceSst(name, dst);
+        }
+
+        // 2) Wymiana MemTableRef na świeże (czyści tombstony i „pofragmentowanie” pamięci)
+        await WriterLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            foreach (var k in _tables.Keys)
+            {
+                // swap na pustą memę
+                var old = _tables[k].Swap(new MemTable());
+                // stara instancja do GC
+            }
+        }
+        finally
+        {
+            WriterLock.Release();
+        }
+
+        // 3) Opróżnij WAL
+        await Wal.FlushAsync(ct).ConfigureAwait(false);
+        if (Wal is WalWriter ww)
+            await ww.TruncateAsync(ct).ConfigureAwait(false);
+    }
 
     public ValueTask<StorageVersionInfo> GetStorageVersionAsync(CancellationToken ct = default)
         => ValueTask.FromResult(new StorageVersionInfo(1, "WalnutDb-0.1", Array.Empty<string>()));
