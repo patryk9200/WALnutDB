@@ -12,7 +12,7 @@ namespace WalnutDb.Core;
 /// </summary>
 internal static class WalRecovery
 {
-    public static void Replay(string walPath, ConcurrentDictionary<string, MemTable> tables)
+    public static void Replay(string walPath, ConcurrentDictionary<string, MemTable> tables, IEncryption? encryption = null)
     {
         if (!File.Exists(walPath)) return;
 
@@ -78,6 +78,9 @@ internal static class WalRecovery
                         off += tlen;
                         var key = span.Slice(off, klen).ToArray(); off += klen;
                         var val = span.Slice(off, vlen).ToArray();
+
+                        if (encryption is not null)
+                            val = encryption.Decrypt(val, table, key); // <- NOWE
 
                         if (!pending.TryGetValue(txId, out var list))
                             list = pending[txId] = new List<Action>(8);
