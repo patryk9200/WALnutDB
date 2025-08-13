@@ -52,9 +52,9 @@ public class WalWriterThroughputBench
     }
 
     [GlobalCleanup]
-    public async Task GlobalCleanup()
+    public void GlobalCleanup()
     {
-        await _wal.DisposeAsync();
+        _wal.DisposeAsync().AsTask().GetAwaiter().GetResult();
         try { Directory.Delete(_dir, recursive: true); } catch { }
     }
 }

@@ -24,18 +24,19 @@ public class IndexScanBench
     private ITable<IdxBenchDoc> _t = default!;
 
     [IterationSetup]
-    public async Task Setup()
+    public void Setup()
     {
         _dir = Path.Combine(Path.GetTempPath(), "WalnutDbBench", "scan", Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(_dir);
         var wal = new WalWriter(Path.Combine(_dir, "wal.log"));
         _db = new WalnutDatabase(_dir, new DatabaseOptions(), new FileSystemManifestStore(_dir), wal);
-        _t = await _db.OpenTableAsync(new TableOptions<IdxBenchDoc> { GetId = d => d.Id });
+        _t = _db.OpenTableAsync(new TableOptions<IdxBenchDoc> { GetId = d => d.Id })
+                .GetAwaiter().GetResult();
 
         for (int i = 0; i < N; i++)
-            await _t.UpsertAsync(new IdxBenchDoc { Id = $"k{i}", Val = i });
+            _t.UpsertAsync(new IdxBenchDoc { Id = $"k{i}", Val = i }).GetAwaiter().GetResult();
 
-        await _db.CheckpointAsync(); // przerzuć dane do SST, żeby skan był realistyczny
+        _db.CheckpointAsync().AsTask().GetAwaiter().GetResult();
     }
 
     [Benchmark]
@@ -51,9 +52,9 @@ public class IndexScanBench
     }
 
     [IterationCleanup]
-    public async Task Cleanup()
+    public void Cleanup()
     {
-        await _db.DisposeAsync();
+        _db.DisposeAsync().AsTask().GetAwaiter().GetResult();
         try { Directory.Delete(_dir, recursive: true); } catch { }
     }
 }

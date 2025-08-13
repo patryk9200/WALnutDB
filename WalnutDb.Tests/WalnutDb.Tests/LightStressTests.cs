@@ -19,7 +19,7 @@ public sealed class LightStressTests
         return dir;
     }
 
-    [Fact(Skip = "Long-running. Enable locally.")]
+    [Fact]
     public async Task TenThousand_Writes_Then_Checkpoint_Then_Reopen()
     {
         var dir = NewTempDir();

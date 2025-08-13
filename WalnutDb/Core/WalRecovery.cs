@@ -15,15 +15,20 @@ internal static class WalRecovery
     public static void Replay(string walPath, ConcurrentDictionary<string, MemTable> tables)
     {
         if (!File.Exists(walPath)) return;
+
         using var fs = new FileStream(walPath, new FileStreamOptions
         {
             Mode = FileMode.Open,
             Access = FileAccess.Read,
-            Share = FileShare.ReadWrite,          // <- klucz: pozwól współistnieć uchwytowi z zapisem
+            Share = FileShare.ReadWrite,          // pozwól współistnieć uchwytowi z zapisem
             Options = FileOptions.SequentialScan
         });
 
         var crc = new Crc32();
+
+        // Bufory przeniesione poza pętlę (CA2014)
+        Span<byte> lenBuf = stackalloc byte[4];
+        Span<byte> crcBuf = stackalloc byte[4];
 
         // TxId -> lista operacji do zastosowania przy commit
         var pending = new Dictionary<ulong, List<Action>>();
@@ -31,19 +36,17 @@ internal static class WalRecovery
         while (fs.Position + 8 <= fs.Length) // min: len(4)+crc(4)
         {
             // len
-            Span<byte> lenBuf = stackalloc byte[4];
-            if (fs.Read(lenBuf) != 4) break;
+            if (!TryReadExactly(fs, lenBuf)) break;
             uint len = BinaryPrimitives.ReadUInt32LittleEndian(lenBuf);
             if (len > fs.Length - fs.Position - 4) break; // niepełna ramka → przerwij
 
             // payload
             var payload = new byte[len];
-            if (fs.Read(payload, 0, payload.Length) != payload.Length) break;
+            if (!TryReadExactly(fs, payload)) break;
 
             // crc
-            Span<byte> cbuf = stackalloc byte[4];
-            if (fs.Read(cbuf) != 4) break;
-            uint fileCrc = BinaryPrimitives.ReadUInt32LittleEndian(cbuf);
+            if (!TryReadExactly(fs, crcBuf)) break;
+            uint fileCrc = BinaryPrimitives.ReadUInt32LittleEndian(crcBuf);
             uint calcCrc = crc.Compute(payload);
             if (fileCrc != calcCrc) break; // uszkodzona ramka → przerwij
 
@@ -113,7 +116,7 @@ internal static class WalRecovery
                     {
                         if (span.Length < 1 + 8 + 4) break;
                         ulong txId = BinaryPrimitives.ReadUInt64LittleEndian(span.Slice(1, 8));
-                        // opsCount = BinaryPrimitives.ReadInt32LittleEndian(span.Slice(9,4)); // na razie nieużywane
+                        // opsCount = BinaryPrimitives.ReadInt32LittleEndian(span.Slice(9,4)); // nieużywane
 
                         if (pending.TryGetValue(txId, out var list))
                         {
@@ -123,14 +126,29 @@ internal static class WalRecovery
                         break;
                     }
                 default:
-                    // nieznana ramka → przerwij (bezpieczniej zatrzymać się)
+                    // nieznana ramka → bezpiecznie zatrzymać się
                     fs.Position = fs.Length;
                     break;
             }
         }
 
-        // Uwaga: transakcje bez COMMIT pozostają w pending i są ignorowane (brak apply) – to OK.
+        // Transakcje bez COMMIT pozostają w pending i są ignorowane — to OK.
     }
+
+    private static bool TryReadExactly(Stream s, Span<byte> dst)
+    {
+        int readTotal = 0;
+        while (readTotal < dst.Length)
+        {
+            int r = s.Read(dst.Slice(readTotal));
+            if (r == 0) return false;
+            readTotal += r;
+        }
+        return true;
+    }
+
+    private static bool TryReadExactly(Stream s, byte[] dst)
+        => TryReadExactly(s, dst.AsSpan());
 
     // lokalny CRC32 (polinom 0xEDB88320)
     private sealed class Crc32
