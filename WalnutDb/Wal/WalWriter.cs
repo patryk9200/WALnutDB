@@ -23,6 +23,7 @@ public sealed class WalWriter : IWalWriter
     private readonly Task _loop;
     private readonly Crc32 _crc = new();
     private readonly SemaphoreSlim _ioGate = new(1, 1); // serializacja operacji
+    private int _disposeOnce;
 
     public WalWriter(string path, TimeSpan? groupWindow = null, int maxBatch = 256)
     {
@@ -39,7 +40,7 @@ public sealed class WalWriter : IWalWriter
         _fs.Seek(0, SeekOrigin.End);
         _loop = Task.Run(WriterLoopAsync);
     }
-
+    
     public async ValueTask TruncateAsync(CancellationToken ct = default)
     {
         await _ioGate.WaitAsync(ct).ConfigureAwait(false);
@@ -76,24 +77,21 @@ public sealed class WalWriter : IWalWriter
         var pending = new List<WalItem>(_maxBatch);
         try
         {
-            while (await reader.WaitToReadAsync(_cts.Token))
+            while (await reader.WaitToReadAsync(_cts.Token).ConfigureAwait(false))
             {
                 pending.Clear();
                 if (reader.TryRead(out var first)) pending.Add(first);
-                // okno grupujące – zbieraj do czasu lub do rozmiaru
+
                 var sw = ValueStopwatch.StartNew();
                 while (pending.Count < _maxBatch && sw.Elapsed < _groupWindow && reader.TryRead(out var item))
                     pending.Add(item);
 
-                // zapis batcha
                 foreach (var item in pending)
                     foreach (var frame in item.Frames)
                         await WriteFrameAsync(frame, _cts.Token).ConfigureAwait(false);
 
-                // Trwałe flush do dysku – sync, bo FileStream nie ma FlushAsync(true)
                 _fs.Flush(true);
 
-                // sygnał dla wszystkich z paczki
                 foreach (var item in pending)
                     item.Promise.TrySetResult(true);
             }
@@ -103,7 +101,14 @@ public sealed class WalWriter : IWalWriter
         {
             foreach (var item in pending)
                 item.Promise.TrySetException(ex);
-            // TODO: log + sygnał do bazy
+
+            // Spróbuj opróżnić kolejkę i też zasygnalizować błąd
+            try
+            {
+                while (reader.TryRead(out var item))
+                    item.Promise.TrySetException(ex);
+            }
+            catch { /* ignore */ }
         }
     }
 
@@ -134,12 +139,34 @@ public sealed class WalWriter : IWalWriter
 
     public async ValueTask DisposeAsync()
     {
-        _queue.Writer.TryComplete();
-        _cts.Cancel();
+        if (Interlocked.Exchange(ref _disposeOnce, 1) != 0)
+            return;
+
+        // Zakończ przyjmowanie zadań
+        try { _queue.Writer.TryComplete(); } catch { /* ignore */ }
+
+        // Przerwij pętlę
+        try { _cts.Cancel(); } catch (ObjectDisposedException) { /* already disposed elsewhere */ }
+
+        // Poczekaj aż pętla się zakończy
         try { await _loop.ConfigureAwait(false); } catch { /* ignore */ }
-        _fs.Flush(true);
-        await _fs.DisposeAsync().ConfigureAwait(false);
-        _cts.Dispose();
+
+        // (Opcjonalnie) oznacz wszystkie niedoszłe promise jako faulted,
+        // żeby nikt nie zawisł czekając na WhenCommitted
+        try
+        {
+            while (_queue.Reader.TryRead(out var item))
+                item.Promise.TrySetException(new ObjectDisposedException(nameof(WalWriter)));
+        }
+        catch { /* ignore */ }
+
+        // Dokończ IO
+        try { _fs.Flush(true); } catch { /* ignore */ }
+        try { await _fs.DisposeAsync().ConfigureAwait(false); } catch { /* ignore */ }
+
+        // Na końcu sprzątnij CTS
+        try { _cts.Dispose(); } catch { /* ignore */ }
+
     }
 }
 

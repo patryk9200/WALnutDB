@@ -110,28 +110,33 @@ internal sealed class DefaultTable<T> : ITable<T>
             if (!idx.Unique) continue;
 
             var newValObj = idx.Extract(item);
-            // Konwencja: NULL nie łapie unikalności (jak w SQL) – pomijamy sprawdzanie
-            if (newValObj is null) continue;
+            if (newValObj is null) continue; // NULL nie podlega unikalności (jak w SQL)
 
             var prefix = IndexKeyCodec.Encode(newValObj, idx.DecimalScale);
-            var to = IndexKeyCodec.NextPrefix(prefix) ?? Array.Empty<byte>();
+            var to = IndexKeyCodec.PrefixUpperBound(prefix);
 
-            // 1) Mem (snapshot, bez awaitów)
+            // 1) Mem
             foreach (var kv in idx.Mem.Current.SnapshotRange(prefix, to, afterKeyExclusive: null))
             {
                 if (kv.Value.Tombstone) continue;
                 var pk = IndexKeyCodec.ExtractPrimaryKey(kv.Key);
                 if (!ByteArrayEquals(pk, key))
                     throw new InvalidOperationException($"Unique index '{idx.Name}' violation for value '{newValObj}'.");
+                break;
             }
 
-            // 2) SST
+            // 2) SST – ignoruj, jeśli mem-index ma tombstone na TEN sam composite key
             foreach (var kv in _db.ScanSstRange(idx.IndexTableName, prefix, to))
             {
+                if (HasMemTombstone(idx.Mem.Current, kv.Key))
+                    continue; // stary wpis z SST jest przykryty tombstonem w memce
+
                 var pk = IndexKeyCodec.ExtractPrimaryKey(kv.Key);
                 if (!ByteArrayEquals(pk, key))
                     throw new InvalidOperationException($"Unique index '{idx.Name}' violation for value '{newValObj}'.");
+                break; // wystarczy pierwszy trafiony
             }
+
         }
 
         // —— główny PUT —— //
@@ -164,7 +169,7 @@ internal sealed class DefaultTable<T> : ITable<T>
         return ValueTask.FromResult(true);
     }
 
-    public ValueTask<bool> DeleteAsync(object id, ITransaction txHandle, CancellationToken ct = default)
+    public async ValueTask<bool> DeleteAsync(object id, ITransaction txHandle, CancellationToken ct = default)
     {
         if (txHandle is not WalnutTransaction tx)
             throw new InvalidOperationException("Unknown transaction type.");
@@ -173,15 +178,28 @@ internal sealed class DefaultTable<T> : ITable<T>
 
         bool hasOld = false;
         T old = default!;
+
+        // 1) Spróbuj z bieżącej memki
         if (_memRef.Current.TryGet(key, out var rawOld) && rawOld is not null)
         {
             old = _map.Deserialize(rawOld);
             hasOld = true;
         }
+        else
+        {
+            // 2) …a jak nie ma, spróbuj z SST (po checkpoint'cie stary rekord siedzi w segmencie)
+            if (_db.TryGetFromSst(_name, key, out var sstVal) && sstVal is not null)
+            {
+                old = _map.Deserialize(sstVal);
+                hasOld = true;
+            }
+        }
 
+        // Główny delete w tabeli
         tx.AddDelete(_name, key);
         tx.AddApply(() => _memRef.Current.Delete(key));
 
+        // Index tombstones — kluczowe, by przykryć stare wpisy z SST
         if (hasOld)
         {
             foreach (var idx in _indexes)
@@ -194,7 +212,7 @@ internal sealed class DefaultTable<T> : ITable<T>
             }
         }
 
-        return ValueTask.FromResult(true);
+        return true;
     }
 
     public ValueTask<bool> DeleteAsync(T item, ITransaction txHandle, CancellationToken ct = default)
@@ -282,8 +300,6 @@ internal sealed class DefaultTable<T> : ITable<T>
         await foreach (var item in ScanByKeyAsync(empty, empty, pageSize, token, ct))
             yield return item;
     }
-
-
 
     public async IAsyncEnumerable<T> ScanByKeyAsync(ReadOnlyMemory<byte> fromInclusive, ReadOnlyMemory<byte> toExclusive, int pageSize = 1024, ReadOnlyMemory<byte> token = default, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
@@ -390,6 +406,10 @@ internal sealed class DefaultTable<T> : ITable<T>
                 var rec = sstEnum.Current;
                 hasSst = sstEnum.MoveNext();
 
+                // ← NOWE: jeżeli mem-index ma tombstone dla tego compositeKey, zignoruj wpis z SST
+                if (HasMemTombstone(idx.Mem.Current, rec.Key))
+                    continue;
+
                 var pk = IndexKeyCodec.ExtractPrimaryKey(rec.Key);
                 if (after is null || ByteCompare(rec.Key, after) > 0)
                 {
@@ -417,11 +437,17 @@ internal sealed class DefaultTable<T> : ITable<T>
         }
     }
 
-    public async IAsyncEnumerable<T> QueryAsync(Func<T, bool> predicate, IndexHint hint, int pageSize = 1024, ReadOnlyMemory<byte> token = default, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+    public async IAsyncEnumerable<T> QueryAsync(
+    Func<T, bool> predicate,
+    IndexHint hint,
+    int pageSize = 1024,
+    ReadOnlyMemory<byte> token = default,
+    [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
         var idx = _indexes.Find(i => string.Equals(i.Name, hint.IndexName, StringComparison.Ordinal));
         if (idx is null)
         {
+            // fallback bez indeksu
             await foreach (var it in QueryAsync(predicate, pageSize, token, ct))
                 yield return it;
             yield break;
@@ -430,19 +456,46 @@ internal sealed class DefaultTable<T> : ITable<T>
         var start = hint.Start.IsEmpty ? ReadOnlyMemory<byte>.Empty : hint.Start;
         var end = hint.End.IsEmpty ? ReadOnlyMemory<byte>.Empty : hint.End;
 
-        int sent = 0;
+        int skipped = 0;
+        int yielded = 0;
+        int? limit = hint.Take;
+
+        // Uwaga: na razie Asc=false ignorujemy (zwracamy rosnąco)
         await foreach (var item in ScanByIndexAsync(idx.Name, start, end, pageSize, token, ct))
         {
-            if (predicate(item))
-            {
-                yield return item;
-                if (++sent >= pageSize) { sent = 0; await Task.Yield(); }
-            }
+            if (hint.Skip > 0 && skipped < hint.Skip) { skipped++; continue; }
+            if (!predicate(item)) continue;
+
+            yield return item;
+            yielded++;
+            if (limit is int l && yielded >= l) yield break;
         }
     }
 
 
+
     // ---------------- Helpers ----------------
+    // Zwraca górną granicę (exclusive) dla "dokładnie tego" klucza.
+    // Dzięki regule porównania (najpierw bytes, potem długość), [key, key||0x00) obejmuje dokładnie 'key'.
+    private static byte[] ExactUpperBound(byte[] key)
+    {
+        var to = new byte[key.Length + 1];
+        Buffer.BlockCopy(key, 0, to, 0, key.Length);
+        to[^1] = 0x00;
+        return to;
+    }
+
+    // Sprawdza, czy w danej MemTable istnieje TOMB STONE dla dokładnie 'compositeKey'.
+    private static bool HasMemTombstone(MemTable mem, byte[] compositeKey)
+    {
+        foreach (var kv in mem.SnapshotRange(compositeKey, ExactUpperBound(compositeKey), afterKeyExclusive: null))
+        {
+            // pierwszy (i jedyny) rekord w tym zakresie to dokładnie ten klucz
+            return kv.Value.Tombstone;
+        }
+        return false;
+    }
+
     private static bool ByteArrayEquals(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b)
     {
         if (a.Length != b.Length) return false;

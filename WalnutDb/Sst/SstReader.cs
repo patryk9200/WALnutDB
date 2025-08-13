@@ -16,7 +16,7 @@ internal sealed class SstReader : IDisposable
         {
             Mode = FileMode.Open,
             Access = FileAccess.Read,
-            Share = FileShare.ReadWrite,
+            Share = FileShare.ReadWrite | FileShare.Delete,
             Options = FileOptions.SequentialScan
         });
 

@@ -47,7 +47,7 @@ public sealed class IndexHintRangeTests
         for (int i = 0; i < 5; i++)
             await t.UpsertAsync(new HintDoc { Id = $"a{i}", Val = i });
 
-        var hint = IndexHint.FromValues("Val", start: 2, end: null); // [2, +∞)
+        var hint = IndexHint.FromStart("Val", start: 2); // [2, +∞)
         int count = 0;
         await foreach (var _ in t.QueryAsync(x => true, hint)) count++;
         Assert.Equal(3, count);

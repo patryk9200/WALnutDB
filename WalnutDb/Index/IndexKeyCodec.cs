@@ -41,6 +41,19 @@ public static class IndexKeyCodec
         };
     }
 
+    public static byte[] PrefixUpperBound(ReadOnlySpan<byte> prefix)
+    {
+        // znajdź od końca pierwszy bajt != 0xFF i inkrementuj
+        var buf = prefix.ToArray();
+        for (int i = buf.Length - 1; i >= 0; i--)
+        {
+            if (buf[i] != 0xFF) { buf[i]++; Array.Resize(ref buf, i + 1); return buf; }
+        }
+        // wszystko 0xFF → brak ścisłej górnej granicy: użyj prefix jako "do końca"
+        return Array.Empty<byte>(); // interpretujemy jako +∞ w naszych ScanRange
+    }
+
+
     public static byte[] ComposeIndexEntryKey(ReadOnlySpan<byte> indexKeyPrefix, ReadOnlySpan<byte> primaryKey)
     {
         // K = indexKey || primaryKey || pkLen:u16 (BE)

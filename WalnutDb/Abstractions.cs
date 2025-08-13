@@ -21,6 +21,7 @@ public enum TypeNamingStrategy { TypeFullName, TypeNameOnly, AssemblyQualifiedNo
 /// </summary>
 public sealed class DatabaseOptions
 {
+    public IEncryption? Encryption { get; init; }
     /// <summary>Strategia wyprowadzania nazw tabel na podstawie typu T.</summary>
     public TypeNamingStrategy TypeNaming { get; init; } = TypeNamingStrategy.TypeFullName;
 
