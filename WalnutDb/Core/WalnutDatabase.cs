@@ -463,6 +463,9 @@ public sealed class WalnutDatabase : IDatabase
             try { s.Dispose(); } catch { }
         _sst.Clear();
         await Wal.DisposeAsync().ConfigureAwait(false);
+
+        if (_options.Encryption is IDisposable disp)
+            disp.Dispose();
     }
 
     public ValueTask FlushAsync(CancellationToken ct = default)

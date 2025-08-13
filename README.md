@@ -196,6 +196,30 @@ await using (var tx = await db.BeginTransactionAsync())
 
 ---
 
+### Encryption at rest
+
+WALnutDB can encrypt values at rest (WAL + SST) with AES-GCM. Keys and index keys remain plaintext for sortability.
+
+**What is encrypted:** table values written to WAL and SST.  
+**What is not encrypted:** primary keys, index keys (they include the index value), filenames/metadata.
+
+**Threat model:** protects against offline reads of WAL/SST files. In-memory data is plaintext.
+
+**Usage:**
+```csharp
+var key = Convert.FromHexString("00112233445566778899AABBCCDDEEFF00112233445566778899AABBCCDDEEFF");
+await using var wal = new WalWriter(Path.Combine(dir, "wal.log"));
+await using var db = new WalnutDatabase(
+    dir,
+    new DatabaseOptions { Encryption = new AesGcmEncryption(key) },
+    new FileSystemManifestStore(dir),
+    wal);
+
+var tbl = await db.OpenTableAsync(new TableOptions<MyDoc> { GetId = d => d.Id });
+await tbl.UpsertAsync(new MyDoc { Id = "x", Secret = "hello" });
+
+---
+
 ## Durability & Checkpoints
 
 - `await db.FlushAsync()` — fsync WAL (fast).
