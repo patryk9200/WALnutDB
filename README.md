@@ -3,7 +3,7 @@
 > A simple, safe embedded database for .NET 8+. Built for devices with little RAM and slow flash (SD/eMMC). It uses Write-Ahead Logging (WAL) for power-loss durability, compacts data into sorted segment files (SST), and provides secondary indexes and time-series scans. Fully managed (no native deps), cross-platform, and async by default.
 
 <p align="center">
-  <img src="assets/walnutdb-mascot.svg" alt="WALnutDB mascot" width="220"/>
+  <img src="logo.jpg" alt="WALnutDB mascot" width="220"/>
 </p>
 
 [![NuGet](https://img.shields.io/nuget/v/WALnutDB.svg)](https://www.nuget.org/packages/WALnutDB)
@@ -92,7 +92,7 @@ await db.CheckpointAsync();
 
 ## Secondary Indexes
 
-Deklaruj indeksy atrybutami na typie danych:
+Declare indexes:
 
 ```csharp
 public sealed class Product
@@ -107,7 +107,7 @@ public sealed class Product
 }
 ```
 
-Otwórz tabelę i skanuj zakresy (decimal + string prefix):
+Open table and scan ranges (decimal + string prefix):
 
 ```csharp
 using System.Text.Json;
@@ -143,7 +143,7 @@ await foreach (var p in products.ScanByIndexAsync("Category", start, end))
 
 ## Time-Series
 
-Podaj **series id** i **UTC timestamp**. Klucze są kodowane tak, by porządek bajtowy był czasowy.
+Provide a **series id** and a **UTC timestamp**. Keys are encoded so that lexicographic byte order matches chronological order.
 
 ```csharp
 public sealed class SensorSample
@@ -176,8 +176,7 @@ await foreach (var s in ts.QueryAsync("dev-1", fromUtc, toUtc))
 ---
 
 ## Transactions
-
-Obsługiwane są transakcje **automatyczne** (implicit) i **ręczne** (explicit).
+Both automatic **(implicit)** and manual **(explicit)** transactions are supported.
 
 ```csharp
 // Auto: each call is an individual transaction
@@ -196,21 +195,21 @@ await using (var tx = await db.BeginTransactionAsync())
 
 ## Durability & Checkpoints
 
-- `await db.FlushAsync()` — fsync WAL (szybkie).
-- `await db.CheckpointAsync()` — flush memtables → SST i **truncate WAL**.
-- Odtwarzanie czyta `wal.log`, weryfikuje CRC każdej ramki, odtwarza **zatwierdzone** transakcje i bezpiecznie zatrzymuje się na przerwanym ogonie.
+- `await db.FlushAsync()` — fsync WAL (fast).
+- `await db.CheckpointAsync()` — flush memtables → SST and **truncate the WAL**.
+- Recovery reads `wal.log`, verifies the CRC of each frame, replays **committed** transactions, and safely stops at a torn tail.
 
-Dla bezpiecznego wyłączenia na urządzeniach embedded:
+For safe shutdown on embedded devices:
 
 ```csharp
-await db.CheckpointAsync(); // skraca recovery + zmniejsza WAL
+await db.CheckpointAsync();  // shortens recovery time and shrinks the WAL
 ```
 
 ---
 
 ## Preflight Checks
 
-Weryfikuj uprawnienia, miejsce i możliwość lockowania:
+Verify permissions, free space, and ability to acquire exclusive locks:
 
 ```csharp
 var report = await db.PreflightAsync(dir, reserveBytes: 4 * 1024 * 1024);
@@ -221,28 +220,10 @@ Console.WriteLine($"{report.FileSystem} free={report.FreeBytes} CanExclusive={re
 
 ## Benchmarks
 
-W repo jest projekt **BenchmarkDotNet** (`WalnutDb.Bench`). Uruchom w **Release**:
+In this repo there is **BenchmarkDotNet** (`WalnutDb.Bench`). Run in **Release**:
 
 ```bash
 dotnet run -c Release --project WalnutDb.Bench
-```
-
----
-
-## NuGet Icon
-
-Readme na GitHubie może renderować **SVG**, ale NuGet wymaga **PNG** przez `PackageIcon`. Wyeksportuj `assets/walnutdb-mascot.svg` do np. `assets/icon-128.png` i dodaj do `.csproj`:
-
-```xml
-<PropertyGroup>
-  <PackageReadmeFile>README.md</PackageReadmeFile>
-  <PackageIcon>icon-128.png</PackageIcon>
-</PropertyGroup>
-
-<ItemGroup>
-  <None Include="assets\icon-128.png" Pack="true" PackagePath="\" />
-  <None Include="README.md" Pack="true" PackagePath="\" />
-</ItemGroup>
 ```
 
 ---
