@@ -126,7 +126,9 @@ internal sealed class DefaultTable<T> : ITable<T>
                 if (!idx.Unique) continue;
 
                 var newValObj = idx.Extract(item);
-                if (newValObj is null) continue; // NULL nie podlega unikalności
+
+                if (newValObj is null) 
+                    continue; // NULL nie podlega unikalności
 
                 var newPrefix = IndexKeyCodec.Encode(newValObj, idx.DecimalScale);
                 var newIdxKey = IndexKeyCodec.ComposeIndexEntryKey(newPrefix, key);
@@ -201,6 +203,10 @@ internal sealed class DefaultTable<T> : ITable<T>
         foreach (var idx in _indexes)
         {
             var newValObj = idx.Extract(item);
+
+            if (newValObj is null)
+                continue;
+
             var newPrefix = IndexKeyCodec.Encode(newValObj, idx.DecimalScale);
             var newIdxKey = IndexKeyCodec.ComposeIndexEntryKey(newPrefix, key);
 
@@ -224,6 +230,12 @@ internal sealed class DefaultTable<T> : ITable<T>
                 }
             }
 
+            if (idx.Unique)
+            {
+                // sanity check – musimy być właścicielem guardu dla (idx, prefix)
+                if (!_db.IsUniqueOwner(idx.IndexTableName, newPrefix, key))
+                    throw new InvalidOperationException("reserve/owner mismatch");
+            }
             // zawsze zapisz nowy wpis indeksu
             tx.AddPut(idx.IndexTableName, newIdxKey, Array.Empty<byte>());
             tx.AddApply(() => idx.Mem.Current.Upsert(newIdxKey, Array.Empty<byte>()));
@@ -342,7 +354,6 @@ internal sealed class DefaultTable<T> : ITable<T>
         return ValueTask.FromResult(true);
     }
 
-    // ---------------- Odczyty (bez zmian) ----------------
     public ValueTask<T?> GetAsync(object id, CancellationToken ct = default)
     {
         var key = _map.EncodeIdToBytes(id);
@@ -350,13 +361,16 @@ internal sealed class DefaultTable<T> : ITable<T>
         if (_memRef.Current.TryGet(key, out var raw) && raw is not null)
             return ValueTask.FromResult<T?>(_map.Deserialize(raw));
 
+        // ⬇⬇⬇ KLUCZOWE: jeśli w MEM jest tombstone, NIE czytamy z SST
+        if (HasMemTombstone(_memRef.Current, key))
+            return ValueTask.FromResult<T?>(default);
+
         if (_db.TryGetFromSst(_name, key, out var fromSst) && fromSst is not null)
         {
             var enc = _db.Encryption;
             var payload = (enc is null) ? fromSst : enc.Decrypt(fromSst, _name, key);
             return ValueTask.FromResult<T?>(_map.Deserialize(payload));
         }
-
         return ValueTask.FromResult<T?>(default);
     }
 
@@ -445,6 +459,9 @@ internal sealed class DefaultTable<T> : ITable<T>
             {
                 var rec = sstEnum.Current;
                 hasSst = sstEnum.MoveNext();
+
+                // ⬇⬇⬇ nie pokazuj klucza przykrytego tombstonem w MEM
+                if (HasMemTombstone(_memRef.Current, rec.Key)) continue;
 
                 if (after is null || ByteCompare(rec.Key, after) > 0)
                 {

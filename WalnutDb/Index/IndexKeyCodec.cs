@@ -156,13 +156,16 @@ public static class IndexKeyCodec
         return buf;
     }
 
-    public static byte[] ExtractValuePrefix(ReadOnlySpan<byte> compositeKey)
+    public static byte[] ExtractValuePrefix(byte[] compositeKey)
     {
-        var pk = ExtractPrimaryKey(compositeKey.ToArray());
-        int prefixLen = compositeKey.Length - pk.Length;
-        if (prefixLen <= 0) return Array.Empty<byte>();
+        // Tu użyj już istniejącego sposobu wyciągania PK:
+        var pk = ExtractPrimaryKey(compositeKey);
+
+        var prefixLen = compositeKey.Length - pk.Length;
+        if (prefixLen < 0) prefixLen = 0;
+
         var prefix = new byte[prefixLen];
-        compositeKey.Slice(0, prefixLen).CopyTo(prefix);
+        Buffer.BlockCopy(compositeKey, 0, prefix, 0, prefixLen);
         return prefix;
     }
 

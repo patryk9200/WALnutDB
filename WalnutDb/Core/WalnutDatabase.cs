@@ -244,21 +244,10 @@ public sealed class WalnutDatabase : IDatabase
     private static string MakeGuardKey(string indexTableName, ReadOnlySpan<byte> valuePrefix)
         => indexTableName + "|" + Convert.ToBase64String(valuePrefix);
 
-    // już masz wersję byte[]; obie mogą współistnieć
-
-    internal bool IsUniqueOwner(string indexTableName, ReadOnlySpan<byte> prefix, ReadOnlySpan<byte> pk)
+    internal bool IsUniqueOwner(string indexTableName, byte[] valuePrefix, byte[] pk)
     {
-        var gk = MakeGuardKey(indexTableName, prefix);
-        if (_uniqueGuards.TryGetValue(gk, out var owner))
-        {
-            bool ok = ByteArrayEquals(owner, pk);
-            if (Diag.UniqueTrace)
-                Diag.U($"OWNER chk   idx={indexTableName} val={Diag.B64(prefix.ToArray())} me={Diag.B64(pk.ToArray())} ok={ok}");
-            return ok;
-        }
-        if (Diag.UniqueTrace)
-            Diag.U($"OWNER chk   idx={indexTableName} val={Diag.B64(prefix.ToArray())} me={Diag.B64(pk.ToArray())} ok=false (no owner)");
-        return false;
+        var gk = indexTableName + "|" + Convert.ToBase64String(valuePrefix);
+        return _uniqueGuards.TryGetValue(gk, out var owner) && ByteArrayEquals(owner, pk);
     }
 
     internal IEnumerable<(byte[] Key, byte[] Val)> ScanSstRange(string name, byte[] fromInclusive, byte[] toExclusive)
