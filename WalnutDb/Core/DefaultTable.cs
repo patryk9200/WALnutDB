@@ -24,7 +24,7 @@ internal sealed class DefaultTable<T> : ITable<T>
         public required string IndexTableName { get; init; }
         public required MemTableRef Mem { get; init; }
         public int? DecimalScale { get; init; }
-        public bool Unique { get; init; } // miejsce na przyszłą walidację unikalności
+        public bool Unique { get; init; }
     }
 
     private readonly List<IndexDef> _indexes = new();
@@ -33,12 +33,11 @@ internal sealed class DefaultTable<T> : ITable<T>
     {
         _db = db; _name = name; _map = new TableMapper<T>(options); _memRef = memRef;
 
-        // Odkryj wszystkie indeksy [DbIndex(...)] na publicznych właściwościach
         foreach (var prop in typeof(T).GetProperties(BindingFlags.Instance | BindingFlags.Public))
         {
             foreach (var attr in prop.GetCustomAttributes<DbIndexAttribute>())
             {
-                var idxName = attr.Name; // wymagane przez Twój atrybut
+                var idxName = attr.Name;
                 var indexTable = $"__index__{_name}__{idxName}";
                 var idxMemRef = _db.GetOrAddMemRef(indexTable);
 
@@ -86,6 +85,14 @@ internal sealed class DefaultTable<T> : ITable<T>
     public ValueTask<bool> DeleteAsync(string id, CancellationToken ct = default)
         => DeleteAsync((object)id, ct);
 
+    public ValueTask<bool> DeleteAsync(Guid id, ITransaction tx, CancellationToken ct = default)
+    => DeleteAsync((object)id, tx, ct);
+
+    public ValueTask<bool> DeleteAsync(string id, ITransaction tx, CancellationToken ct = default)
+        => DeleteAsync((object)id, tx, ct);
+
+
+    // ---------------- Explicit TX ----------------
     public ValueTask<bool> UpsertAsync(T item, ITransaction txHandle, CancellationToken ct = default)
     {
         if (txHandle is not WalnutTransaction tx)
@@ -94,7 +101,7 @@ internal sealed class DefaultTable<T> : ITable<T>
         var key = _map.GetKeyBytes(item);
         var val = _map.Serialize(item);                         // plaintext do MEM
         var enc = _db.Encryption;
-        var walVal = enc is null ? val : enc.Encrypt(val, _name, key); // szyfr do WAL
+        var walVal = enc is null ? val : enc.Encrypt(val, _name, key); // ciphertext do WAL
 
         // stary rekord z MEM (dla aktualizacji indeksów i optymalizacji checku)
         bool hasOld = false;
@@ -105,7 +112,9 @@ internal sealed class DefaultTable<T> : ITable<T>
             hasOld = true;
         }
 
-        // —— unikalność —— //
+        // —— UNIKALNOŚĆ: rezerwacja + dotychczasowe checki —— //
+        var reservations = new List<(string IndexTable, byte[] Prefix)>(); // do zwolnienia po apply
+
         foreach (var idx in _indexes)
         {
             if (!idx.Unique) continue;
@@ -113,32 +122,35 @@ internal sealed class DefaultTable<T> : ITable<T>
             var newValObj = idx.Extract(item);
             if (newValObj is null) continue; // NULL nie podlega unikalności
 
-            // jeśli to update tego samego wiersza i wartość indeksu się nie zmienia → OK
-            if (hasOld)
-            {
-                var oldValObj = idx.Extract(old);
-                if (Equals(newValObj, oldValObj))
-                    goto AfterUniqueCheck;
-            }
-
+            // Jeśli to update i wartość się nie zmienia — teoretycznie można pominąć,
+            // ale dla bezpieczeństwa i tak robimy rezerwację, by wygasić race.
             var newPrefix = IndexKeyCodec.Encode(newValObj, idx.DecimalScale);
             var newIdxKey = IndexKeyCodec.ComposeIndexEntryKey(newPrefix, key);
             var to = IndexKeyCodec.PrefixUpperBound(newPrefix);
 
-            // 1) MEM: żywy wpis (dokładny) dla newIdxKey → to my, OK
+            // 0) REZERWACJA globalna – eliminuje race między równoległymi writerami
+            if (!_db.TryReserveUnique(idx.IndexTableName, newPrefix, key))
+                throw new InvalidOperationException($"Unique index '{idx.Name}' violation for value '{newValObj}'.");
+            reservations.Add((idx.IndexTableName, newPrefix));
+
+            // 1) MEM: czy już mamy dokładnie ten wpis (nasz PK)? → OK
             foreach (var kv in idx.Mem.Current.SnapshotRange(newIdxKey, ExactUpperBound(newIdxKey), afterKeyExclusive: null))
             {
-                if (!kv.Value.Tombstone) goto AfterUniqueCheck;
+                if (!kv.Value.Tombstone)
+                {
+                    // to jest dokładnie (newPrefix|pk) → nasz własny wpis; OK
+                    goto AfterUniqueCheck;
+                }
                 break;
             }
 
-            // 2) SST: dokładny wpis dla newIdxKey → to my (po checkpoint) , OK
+            // 2) SST: dokładny wpis (newPrefix|pk) → też OK (po wcześniejszym checkpoint)
             foreach (var kv in _db.ScanSstRange(idx.IndexTableName, newIdxKey, ExactUpperBound(newIdxKey)))
             {
                 goto AfterUniqueCheck;
             }
 
-            // 3) MEM: ktoś inny ma ten sam prefix? (pomijamy tombstony)
+            // 3) MEM: ktoś inny z tym prefixem?
             foreach (var kv in idx.Mem.Current.SnapshotRange(newPrefix, to, afterKeyExclusive: null))
             {
                 if (kv.Value.Tombstone) continue;
@@ -147,12 +159,10 @@ internal sealed class DefaultTable<T> : ITable<T>
                     throw new InvalidOperationException($"Unique index '{idx.Name}' violation for value '{newValObj}'.");
             }
 
-            // 4) SST: ktoś inny ma ten sam prefix?
-            //    —> zmaskuj wpisy przykryte tombstonem w MEM (po Delete przed kolejnym checkpointem)
+            // 4) SST: ktoś inny z tym prefixem? (z szacunkiem dla tombstonów w MEM)
             foreach (var kv in _db.ScanSstRange(idx.IndexTableName, newPrefix, to))
             {
                 if (HasMemTombstone(idx.Mem.Current, kv.Key)) continue; // przykryty przez MEM-delete
-
                 var existingPk = IndexKeyCodec.ExtractPrimaryKey(kv.Key);
                 if (!ByteArrayEquals(existingPk, key))
                     throw new InvalidOperationException($"Unique index '{idx.Name}' violation for value '{newValObj}'.");
@@ -188,6 +198,14 @@ internal sealed class DefaultTable<T> : ITable<T>
             tx.AddApply(() => idx.Mem.Current.Upsert(newIdxKey, Array.Empty<byte>()));
         }
 
+        // —— ZWOLNIENIE REZERWACJI po zastosowaniu zmian w MEM —— //
+        foreach (var (idxTable, prefix) in reservations)
+        {
+            var capturedIdx = idxTable;
+            var capturedPrefix = prefix;
+            tx.AddApply(() => _db.ReleaseUnique(capturedIdx, capturedPrefix, key));
+        }
+
         return ValueTask.FromResult(true);
     }
 
@@ -201,7 +219,6 @@ internal sealed class DefaultTable<T> : ITable<T>
         bool hasOld = false;
         T old = default!;
 
-        // 1) Spróbuj z bieżącej memki
         if (_memRef.Current.TryGet(key, out var rawOld) && rawOld is not null)
         {
             old = _map.Deserialize(rawOld);
@@ -209,19 +226,18 @@ internal sealed class DefaultTable<T> : ITable<T>
         }
         else
         {
-            // 2) …a jak nie ma, spróbuj z SST (po checkpoint'cie stary rekord siedzi w segmencie)
             if (_db.TryGetFromSst(_name, key, out var sstVal) && sstVal is not null)
             {
-                old = _map.Deserialize(sstVal);
+                var enc = _db.Encryption;
+                var payload = (enc is null) ? sstVal : enc.Decrypt(sstVal, _name, key);
+                old = _map.Deserialize(payload);
                 hasOld = true;
             }
         }
 
-        // Główny delete w tabeli
         tx.AddDelete(_name, key);
         tx.AddApply(() => _memRef.Current.Delete(key));
 
-        // Index tombstones — kluczowe, by przykryć stare wpisy z SST
         if (hasOld)
         {
             foreach (var idx in _indexes)
@@ -244,7 +260,7 @@ internal sealed class DefaultTable<T> : ITable<T>
 
         var key = _map.GetKeyBytes(item);
 
-        bool hasOld = true; // jeśli w memce nie ma, użyjemy wartości z item
+        bool hasOld = true;
         T old = item;
         if (_memRef.Current.TryGet(key, out var rawOld) && rawOld is not null)
             old = _map.Deserialize(rawOld);
@@ -267,22 +283,14 @@ internal sealed class DefaultTable<T> : ITable<T>
         return ValueTask.FromResult(true);
     }
 
-    public ValueTask<bool> DeleteAsync(Guid id, ITransaction txHandle, CancellationToken ct = default)
-        => DeleteAsync((object)id, txHandle, ct);
-
-    public ValueTask<bool> DeleteAsync(string id, ITransaction txHandle, CancellationToken ct = default)
-        => DeleteAsync((object)id, txHandle, ct);
-
-    // ---------------- Odczyty ----------------
+    // ---------------- Odczyty (bez zmian) ----------------
     public ValueTask<T?> GetAsync(object id, CancellationToken ct = default)
     {
         var key = _map.EncodeIdToBytes(id);
 
-        // Mem (plaintext)
         if (_memRef.Current.TryGet(key, out var raw) && raw is not null)
             return ValueTask.FromResult<T?>(_map.Deserialize(raw));
 
-        // SST (szyfrowane, jeśli Encryption != null)
         if (_db.TryGetFromSst(_name, key, out var fromSst) && fromSst is not null)
         {
             var enc = _db.Encryption;
@@ -309,7 +317,7 @@ internal sealed class DefaultTable<T> : ITable<T>
     {
         var idx = _indexes.Find(i => string.Equals(i.Name, hint.IndexName, StringComparison.Ordinal));
         if (idx is null)
-            return await GetFirstAsync(predicate, ct).ConfigureAwait(false); // fallback
+            return await GetFirstAsync(predicate, ct).ConfigureAwait(false);
 
         var start = hint.Start.IsEmpty ? ReadOnlyMemory<byte>.Empty : hint.Start;
         var end = hint.End.IsEmpty ? ReadOnlyMemory<byte>.Empty : hint.End;
@@ -321,9 +329,9 @@ internal sealed class DefaultTable<T> : ITable<T>
     }
 
     public async IAsyncEnumerable<T> GetAllAsync(
-    int pageSize = 1024,
-    ReadOnlyMemory<byte> token = default,
-    [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+        int pageSize = 1024,
+        ReadOnlyMemory<byte> token = default,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
         var empty = ReadOnlyMemory<byte>.Empty;
         await foreach (var item in ScanByKeyAsync(empty, empty, pageSize, token, ct))
@@ -331,11 +339,11 @@ internal sealed class DefaultTable<T> : ITable<T>
     }
 
     public async IAsyncEnumerable<T> ScanByKeyAsync(
-    ReadOnlyMemory<byte> fromInclusive,
-    ReadOnlyMemory<byte> toExclusive,
-    int pageSize = 1024,
-    ReadOnlyMemory<byte> token = default,
-    [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+        ReadOnlyMemory<byte> fromInclusive,
+        ReadOnlyMemory<byte> toExclusive,
+        int pageSize = 1024,
+        ReadOnlyMemory<byte> token = default,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
         var from = fromInclusive.IsEmpty ? Array.Empty<byte>() : fromInclusive.ToArray();
         var to = toExclusive.IsEmpty ? Array.Empty<byte>() : toExclusive.ToArray();
@@ -365,7 +373,7 @@ internal sealed class DefaultTable<T> : ITable<T>
                 {
                     if (after is null || ByteCompare(rec.Key, after) > 0)
                     {
-                        yield return _map.Deserialize(rec.Value.Value); // mem: plaintext
+                        yield return _map.Deserialize(rec.Value.Value);
                         if (++sent >= pageSize) { sent = 0; await Task.Yield(); }
                     }
                     lastKey = rec.Key;
@@ -382,7 +390,7 @@ internal sealed class DefaultTable<T> : ITable<T>
                 if (after is null || ByteCompare(rec.Key, after) > 0)
                 {
                     var payload = (enc is null) ? rec.Val : enc.Decrypt(rec.Val, _name, rec.Key);
-                    yield return _map.Deserialize(payload);            // sst: decrypt
+                    yield return _map.Deserialize(payload);
                     if (++sent >= pageSize) { sent = 0; await Task.Yield(); }
                 }
             }
@@ -390,10 +398,10 @@ internal sealed class DefaultTable<T> : ITable<T>
     }
 
     public async IAsyncEnumerable<T> ScanByIndexAsync(
-    IndexHint hint,
-    int pageSize = 1024,
-    ReadOnlyMemory<byte> token = default,
-    [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+        IndexHint hint,
+        int pageSize = 1024,
+        ReadOnlyMemory<byte> token = default,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
         var idx = _indexes.Find(i => string.Equals(i.Name, hint.IndexName, StringComparison.Ordinal));
         if (idx is null)
@@ -412,7 +420,6 @@ internal sealed class DefaultTable<T> : ITable<T>
         int sent = 0;
         byte[]? lastKey = null;
 
-        // ——— tryb rosnący: push-down Skip/Take w locie ———
         if (hint.Asc)
         {
             int skipped = 0;
@@ -476,10 +483,9 @@ internal sealed class DefaultTable<T> : ITable<T>
             yield break;
         }
 
-        // ——— tryb malejący: bufor „ostatnich K” i odwrócenie ———
-        // K = Skip + Take (jeśli Take brak → buforujemy cały zakres)
+        // DESC – bufor końcówki
         var cap = hint.Take is int t ? (hint.Skip + t) : int.MaxValue;
-        var ring = new LinkedList<T>(); // prosty pierścień
+        var ring = new LinkedList<T>();
 
         while (hasMem || hasSst)
         {
@@ -524,9 +530,8 @@ internal sealed class DefaultTable<T> : ITable<T>
             }
         }
 
-        // yield w odwrotnej kolejności, z pominięciem 'Skip' i ograniczeniem 'Take'
-        var arr = ring.ToArray(); // ascending końcówka
-        int startIndex = arr.Length - 1 - hint.Skip; // pierwszy do zwrócenia w DESC
+        var arr = ring.ToArray();
+        int startIndex = arr.Length - 1 - hint.Skip;
         int remaining = hint.Take ?? int.MaxValue;
 
         for (int i = startIndex; i >= 0 && remaining > 0; i--)
@@ -538,19 +543,23 @@ internal sealed class DefaultTable<T> : ITable<T>
     }
 
     public async IAsyncEnumerable<T> ScanByIndexAsync(
-    string indexName,
-    ReadOnlyMemory<byte> start,
-    ReadOnlyMemory<byte> end,
-    int pageSize = 1024,
-    ReadOnlyMemory<byte> token = default,
-    [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+        string indexName,
+        ReadOnlyMemory<byte> start,
+        ReadOnlyMemory<byte> end,
+        int pageSize = 1024,
+        ReadOnlyMemory<byte> token = default,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
         var hint = new IndexHint(indexName, start, end, Asc: true, Skip: 0, Take: null);
         await foreach (var x in ScanByIndexAsync(hint, pageSize, token, ct))
             yield return x;
     }
 
-    public async IAsyncEnumerable<T> QueryAsync(Func<T, bool> predicate, int pageSize = 1024, ReadOnlyMemory<byte> token = default, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+    public async IAsyncEnumerable<T> QueryAsync(
+        Func<T, bool> predicate,
+        int pageSize = 1024,
+        ReadOnlyMemory<byte> token = default,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
         int sent = 0;
         await foreach (var item in GetAllAsync(pageSize, token, ct))
@@ -564,11 +573,11 @@ internal sealed class DefaultTable<T> : ITable<T>
     }
 
     public async IAsyncEnumerable<T> QueryAsync(
-    Func<T, bool> predicate,
-    IndexHint hint,
-    int pageSize = 1024,
-    ReadOnlyMemory<byte> token = default,
-    [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+        Func<T, bool> predicate,
+        IndexHint hint,
+        int pageSize = 1024,
+        ReadOnlyMemory<byte> token = default,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
         var idx = _indexes.Find(i => string.Equals(i.Name, hint.IndexName, StringComparison.Ordinal));
         if (idx is null)
@@ -578,7 +587,6 @@ internal sealed class DefaultTable<T> : ITable<T>
             yield break;
         }
 
-        // skanuj z tym samym zakresem/porządkiem, ale BEZ Skip/Take (bo mamy predicate)
         var scanHint = hint with { Skip = 0, Take = null };
 
         int skipped = 0, yielded = 0;
@@ -596,8 +604,6 @@ internal sealed class DefaultTable<T> : ITable<T>
     }
 
     // ---------------- Helpers ----------------
-    // Zwraca górną granicę (exclusive) dla "dokładnie tego" klucza.
-    // Dzięki regule porównania (najpierw bytes, potem długość), [key, key||0x00) obejmuje dokładnie 'key'.
     private static byte[] ExactUpperBound(byte[] key)
     {
         var to = new byte[key.Length + 1];
@@ -606,14 +612,10 @@ internal sealed class DefaultTable<T> : ITable<T>
         return to;
     }
 
-    // Sprawdza, czy w danej MemTable istnieje TOMB STONE dla dokładnie 'compositeKey'.
     private static bool HasMemTombstone(MemTable mem, byte[] compositeKey)
     {
         foreach (var kv in mem.SnapshotRange(compositeKey, ExactUpperBound(compositeKey), afterKeyExclusive: null))
-        {
-            // pierwszy (i jedyny) rekord w tym zakresie to dokładnie ten klucz
             return kv.Value.Tombstone;
-        }
         return false;
     }
 

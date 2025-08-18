@@ -1,0 +1,106 @@
+﻿#nullable enable
+using System;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Collections.Generic;
+
+using WalnutDb.Core;
+using WalnutDb.Wal;
+
+namespace WalnutDb.Tests;
+
+file sealed class UxStressUser
+{
+    [DatabaseObjectId] public string Id { get; set; } = "";
+
+    [DbIndex("Email", Unique = true)]
+    public string? Email { get; set; }
+}
+
+public sealed class UniqueIndexStressTests
+{
+    private static string NewTempDir(string name)
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "WalnutDbTests", name, Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        return dir;
+    }
+
+    [Fact]
+    public async Task Unique_Index_No_Duplicates_Under_Contention()
+    {
+        var dir = NewTempDir("stress-ux");
+        await using var wal = new WalWriter(Path.Combine(dir, "wal.log"));
+        await using var db = new WalnutDatabase(dir, new DatabaseOptions(), new FileSystemManifestStore(dir), wal);
+        var tbl = await db.OpenTableAsync(new TableOptions<UxStressUser> { GetId = u => u.Id });
+
+        const int userCount = 200;
+        const int writers = 8;
+        var duration = TimeSpan.FromSeconds(2.5);
+
+        var ids = Enumerable.Range(0, userCount).Select(i => $"U{i:D4}").ToArray();
+        var emails = Enumerable.Range(0, userCount).Select(i => $"e{i:D4}@ex.com").ToArray();
+
+        using var cts = new CancellationTokenSource(duration);
+
+        var tasks = Enumerable.Range(0, writers).Select(async w =>
+        {
+            var rnd = new Random(unchecked(Environment.TickCount * 61 + w * 17));
+            try
+            {
+                while (!cts.IsCancellationRequested)
+                {
+                    var id = ids[rnd.Next(ids.Length)];
+                    var action = rnd.NextDouble();
+
+                    try
+                    {
+                        if (action < 0.10) // 10% delete
+                        {
+                            await tbl.DeleteAsync(id); // ⟵ bez tokena – op kończy się w całości
+                        }
+                        else // 90% upsert
+                        {
+                            var email = emails[rnd.Next(emails.Length)];
+                            await tbl.UpsertAsync(new UxStressUser { Id = id, Email = email }); // ⟵ bez tokena
+                        }
+                    }
+                    catch (InvalidOperationException)
+                    {
+                        // spodziewane kolizje unikalności – ignorujemy
+                    }
+                    await Task.Yield();
+                }
+            }
+            catch (OperationCanceledException) { /* swallow */ }
+        }).ToArray();
+
+        var chkTask = Task.Run(async () =>
+        {
+            while (true)
+            {
+                try { await Task.Delay(200, cts.Token); }
+                catch (OperationCanceledException) { break; }
+
+                try { await db.CheckpointAsync(); } // ⟵ bez tokena
+                catch { /* miękkie błędy ignorujemy */ }
+            }
+        }, cts.Token);
+
+        await Task.WhenAll(tasks.Append(chkTask));
+
+        await db.CheckpointAsync();
+
+        var dupCheck = new Dictionary<string, int>(StringComparer.Ordinal);
+        await foreach (var u in tbl.ScanByIndexAsync("Email", default, default))
+        {
+            if (u.Email is null) continue;
+            dupCheck.TryGetValue(u.Email, out var c);
+            dupCheck[u.Email] = c + 1;
+        }
+
+        foreach (var kv in dupCheck)
+            Assert.True(kv.Value <= 1, $"Duplicate email in index: {kv.Key} count={kv.Value}");
+    }
+}

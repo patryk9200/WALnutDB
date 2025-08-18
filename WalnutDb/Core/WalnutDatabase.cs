@@ -23,6 +23,9 @@ public sealed class WalnutDatabase : IDatabase
     private readonly ConcurrentDictionary<string, MemTableRef> _tables = new();
     internal readonly ConcurrentDictionary<string, TableMetrics> _metrics = new();
 
+    // <<< NOWE: globalne, lekkie „rezerwacje” dla wartości unikalnych >>>
+    private readonly ConcurrentDictionary<string, byte[]> _uniqueGuards = new(StringComparer.Ordinal);
+
     public WalnutDatabase(string directory, DatabaseOptions options, IManifestStore manifest, IWalWriter wal, ITypeNameResolver? typeResolver = null)
     {
         _dir = directory;
@@ -44,9 +47,50 @@ public sealed class WalnutDatabase : IDatabase
         foreach (var file in Directory.EnumerateFiles(_sstDir, "*.sst"))
         {
             var baseName = Path.GetFileNameWithoutExtension(file);
-            var logicalName = DecodeNameFromFile(baseName); // <—
+            var logicalName = DecodeNameFromFile(baseName);
             try { _sst[logicalName] = new SstReader(file); } catch { /* ignore */ }
         }
+    }
+
+    // --- REZERWACJE UNIKALNE (dla indeksów Unique) ---
+
+    // Klucz: "<indexTableName>|<b64(valuePrefix)>"
+    private static string MakeGuardKey(string indexTableName, byte[] valuePrefix)
+        => indexTableName + "|" + Convert.ToBase64String(valuePrefix);
+
+    internal bool TryReserveUnique(string indexTableName, byte[] valuePrefix, byte[] pk)
+    {
+        var gk = MakeGuardKey(indexTableName, valuePrefix);
+
+        while (true)
+        {
+            if (_uniqueGuards.TryGetValue(gk, out var existing))
+            {
+                // Rezerwacja już istnieje:
+                // - jeśli to ten sam PK -> OK (idempotentnie)
+                // - inny PK -> kolizja
+                return ByteArrayEquals(existing, pk);
+            }
+
+            if (_uniqueGuards.TryAdd(gk, pk))
+                return true; // udało się zarezerwować
+            // mała kolizja przy Add -> pętla i sprawdź ponownie
+        }
+    }
+
+    internal void ReleaseUnique(string indexTableName, byte[] valuePrefix, byte[] pk)
+    {
+        var gk = MakeGuardKey(indexTableName, valuePrefix);
+        if (_uniqueGuards.TryGetValue(gk, out var cur) && ByteArrayEquals(cur, pk))
+            _uniqueGuards.TryRemove(gk, out _);
+        // jeśli ktoś podmienił na inny PK (nie powinien), nie ściągamy
+    }
+
+    private static bool ByteArrayEquals(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b)
+    {
+        if (a.Length != b.Length) return false;
+        for (int i = 0; i < a.Length; i++) if (a[i] != b[i]) return false;
+        return true;
     }
 
     internal sealed class TableMetrics
@@ -125,12 +169,16 @@ public sealed class WalnutDatabase : IDatabase
     // (opcjonalnie dla zgodności – jeśli coś jeszcze woła starą wersję)
     internal MemTable GetOrAddMemTable(string name) => GetOrAddMemRef(name).Current;
 
-
     internal bool TryGetFromSst(string name, ReadOnlySpan<byte> key, out byte[]? value)
     {
         value = null;
-        if (_sst.TryGetValue(name, out var sst))
-            return sst.TryGet(key, out value);
+        try
+        {
+            if (_sst.TryGetValue(name, out var sst))
+                return sst.TryGet(key, out value);
+        }
+        catch (IOException) { /* plik był akurat podmieniany — potraktuj jak „brak” */ }
+        catch (ObjectDisposedException) { /* stary reader – potraktuj jak „brak” */ }
         return false;
     }
 
@@ -169,6 +217,7 @@ public sealed class WalnutDatabase : IDatabase
 
     public async ValueTask CheckpointAsync(CancellationToken ct = default)
     {
+        // 1) Freeze & swap wszystkich memek – zgarniamy snapshoty do zrzutu.
         var snapshot = new List<(string Name, MemTable Old)>(_tables.Count);
 
         await WriterLock.WaitAsync(ct).ConfigureAwait(false);
@@ -180,8 +229,8 @@ public sealed class WalnutDatabase : IDatabase
                 var name = kv.Key;
                 var refm = kv.Value;
 
-                var old = refm.Swap(new MemTable());   // świeża memka na przyszłe inserty
-                snapshot.Add((name, old));             // tę starą zrzucimy do SST
+                var old = refm.Swap(new MemTable()); // świeża memka od teraz przyjmuje zapisy
+                snapshot.Add((name, old));           // tę starą zrzucimy do SST (z mergem)
             }
         }
         finally
@@ -191,22 +240,44 @@ public sealed class WalnutDatabase : IDatabase
 
         var enc = Encryption; // może być null
 
+        // 2) Dla każdej tabeli zbuduj nowy SST = (oldMem LIVE ∪ (stary SST \ covered))
         foreach (var (name, oldMem) in snapshot)
         {
             ct.ThrowIfCancellationRequested();
 
-            // zbierz żywe wpisy i posortuj
-            var list = new List<(byte[] Key, byte[] Val)>();
+            var list = new List<(byte[] Key, byte[] Val)>(capacity: 1024);
+            var covered = new HashSet<string>(StringComparer.Ordinal); // klucze obecne w oldMem (żywe i tombstony)
+
+            // 2a) Zbierz wpisy z oldMem: do covered trafiają wszystkie klucze (żywe i tombstone),
+            //     do listy trafiają tylko żywe wartości (Value != null && !Tombstone).
             foreach (var it in oldMem.SnapshotAll(afterKeyExclusive: null))
             {
+                var sig = Convert.ToBase64String(it.Key);
+                covered.Add(sig);
+
                 if (!it.Value.Tombstone && it.Value.Value is not null)
                 {
-                    var v = it.Value.Value;
-                    // do SST zapisujemy ciphertext (jeśli włączone szyfrowanie)
-                    var vOut = enc is null ? v : enc.Encrypt(v, name, it.Key);
+                    var vOut = enc is null ? it.Value.Value : enc.Encrypt(it.Value.Value, name, it.Key);
                     list.Add((it.Key, vOut));
                 }
             }
+
+            // 2b) Dociągnij klucze z poprzedniego SST, których nie nadpisała/nie skasowała oldMem
+            if (_sst.TryGetValue(name, out var prev))
+            {
+                foreach (var (k, v) in prev.ScanRange(Array.Empty<byte>(), Array.Empty<byte>()))
+                {
+                    var sig = Convert.ToBase64String(k);
+                    if (!covered.Contains(sig))
+                    {
+                        // UWAGA: v już jest w formacie na-dysk (plaintext lub ciphertext).
+                        // Nie deszyfrujemy/nie re-encryptujemy – kopiujemy as-is.
+                        list.Add((k, v));
+                    }
+                }
+            }
+
+            // 2c) Posortuj po kluczu
             list.Sort(static (a, b) =>
             {
                 int min = Math.Min(a.Key.Length, b.Key.Length);
@@ -214,7 +285,8 @@ public sealed class WalnutDatabase : IDatabase
                 return a.Key.Length - b.Key.Length;
             });
 
-            async IAsyncEnumerable<(byte[] Key, byte[] Val)> SortedAsync()
+            // 2d) Zapisz nowy SST (atomowo)
+            async IAsyncEnumerable<(byte[] Key, byte[] Val)> Source()
             {
                 foreach (var t in list) { yield return t; await Task.Yield(); }
             }
@@ -223,9 +295,9 @@ public sealed class WalnutDatabase : IDatabase
             var tmp = Path.Combine(_sstDir, $"{safe}.sst.tmp");
             var dst = Path.Combine(_sstDir, $"{safe}.sst");
 
-            await SstWriter.WriteAsync(tmp, SortedAsync(), ct).ConfigureAwait(false);
+            await SstWriter.WriteAsync(tmp, Source(), ct).ConfigureAwait(false);
 
-            // zamknij starego readera przed Replace
+            // Zamknij ewentualnego starego readera przed podmianą pliku
             if (_sst.TryRemove(name, out var oldReader))
             {
                 try { oldReader.Dispose(); } catch { /* ignore */ }
@@ -240,6 +312,7 @@ public sealed class WalnutDatabase : IDatabase
             // oldMem -> GC
         }
 
+        // 3) WAL: flush + truncate
         await Wal.FlushAsync(ct).ConfigureAwait(false);
         await Wal.TruncateAsync(ct).ConfigureAwait(false);
     }

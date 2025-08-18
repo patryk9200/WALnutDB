@@ -1,89 +1,102 @@
-﻿namespace WalnutDb.Core;
+﻿#nullable enable
+using System.Collections.Generic;
+using System.Threading;
 
-/// <summary>
-/// Prosta, w pełni pamięciowa tabela (posortowana po kluczu binarnym),
-/// obsługuje tombstony i snapshoty do iteracji/paginacji.
-/// </summary>
+namespace WalnutDb.Core;
+
 internal sealed class MemTable
 {
-    private readonly SortedDictionary<byte[], Entry> _map =
-        new(ByteArrayComparer.Instance);
+    private readonly ReaderWriterLockSlim _rw = new(LockRecursionPolicy.NoRecursion);
+    private readonly SortedDictionary<byte[], Entry> _map = new(ByteArrayComparer.Instance);
 
     internal readonly struct Entry
     {
         public readonly byte[]? Value;
         public readonly bool Tombstone;
-        public Entry(byte[]? value, bool tombstone)
-        {
-            Value = value; Tombstone = tombstone;
-        }
-    }
-
-    public void Upsert(byte[] key, byte[] value)
-        => _map[key] = new Entry(value, tombstone: false);
-
-    public bool Delete(byte[] key)
-    {
-        if (_map.TryGetValue(key, out var _))
-        {
-            _map[key] = new Entry(null, tombstone: true);
-            return true;
-        }
-        // nawet jeśli nie było – w LSM zwykle zostawiamy tombstone;
-        // dla MemTable uprośćmy:
-        _map[key] = new Entry(null, tombstone: true);
-        return false;
+        public Entry(byte[]? value, bool tombstone) { Value = value; Tombstone = tombstone; }
     }
 
     public bool TryGet(byte[] key, out byte[]? value)
     {
-        if (_map.TryGetValue(key, out var e) && !e.Tombstone)
+        _rw.EnterReadLock();
+        try
         {
-            value = e.Value!;
-            return true;
+            if (_map.TryGetValue(key, out var e) && !e.Tombstone)
+            {
+                value = e.Value;
+                return true;
+            }
+            value = null;
+            return false;
         }
-        value = null; return false;
+        finally { _rw.ExitReadLock(); }
     }
 
-    public IEnumerable<KeyValuePair<byte[], Entry>> SnapshotAll(byte[]? afterKeyExclusive = null)
+    public void Upsert(byte[] key, byte[] value)
     {
-        // Snapshot całego widoku w chwili wywołania
-        var list = new List<KeyValuePair<byte[], Entry>>(_map.Count);
-        foreach (var kv in _map)
-            list.Add(kv);
-
-        if (afterKeyExclusive is null)
-            return list;
-
-        // znajdź pierwsze > afterKeyExclusive
-        var cmp = ByteArrayComparer.Instance;
-        int lo = 0, hi = list.Count - 1, start = list.Count;
-        while (lo <= hi)
-        {
-            int mid = (lo + hi) >> 1;
-            var c = cmp.Compare(list[mid].Key, afterKeyExclusive);
-            if (c <= 0) lo = mid + 1;
-            else { start = mid; hi = mid - 1; }
-        }
-        return new ArraySegment<KeyValuePair<byte[], Entry>>(list.ToArray(), start, list.Count - start);
+        _rw.EnterWriteLock();
+        try { _map[key] = new Entry(value, tombstone: false); }
+        finally { _rw.ExitWriteLock(); }
     }
 
-    public IEnumerable<KeyValuePair<byte[], Entry>> SnapshotRange(
-     byte[] fromInclusive,
-     byte[] toExclusive,
-     byte[]? afterKeyExclusive = null)
+    public void Delete(byte[] key)
     {
-        var cmp = ByteArrayComparer.Instance;
-        var all = SnapshotAll(afterKeyExclusive);
+        _rw.EnterWriteLock();
+        try { _map[key] = new Entry(value: null, tombstone: true); }
+        finally { _rw.ExitWriteLock(); }
+    }
 
-        bool unbounded = toExclusive.Length == 0;
-
-        foreach (var kv in all)
+    public IEnumerable<(byte[] Key, Entry Value)> SnapshotAll(byte[]? afterKeyExclusive)
+    {
+        (byte[] Key, Entry Value)[] snap;
+        _rw.EnterReadLock();
+        try
         {
-            if (cmp.Compare(kv.Key, fromInclusive) < 0) continue;
-            if (!unbounded && cmp.Compare(kv.Key, toExclusive) >= 0) yield break;
-            yield return kv;
+            snap = new (byte[] Key, Entry Value)[_map.Count];
+            int i = 0;
+            foreach (var kv in _map) snap[i++] = (kv.Key, kv.Value);
+        }
+        finally { _rw.ExitReadLock(); }
+
+        if (afterKeyExclusive is null || afterKeyExclusive.Length == 0)
+        {
+            for (int i = 0; i < snap.Length; i++) yield return snap[i];
+            yield break;
+        }
+        for (int i = 0; i < snap.Length; i++)
+            if (ByteCompare(snap[i].Key, afterKeyExclusive) > 0)
+                yield return snap[i];
+    }
+
+    public IEnumerable<(byte[] Key, Entry Value)> SnapshotRange(byte[] fromInclusive, byte[] toExclusive, byte[]? afterKeyExclusive)
+    {
+        (byte[] Key, Entry Value)[] snap;
+        _rw.EnterReadLock();
+        try
+        {
+            snap = new (byte[] Key, Entry Value)[_map.Count];
+            int i = 0;
+            foreach (var kv in _map) snap[i++] = (kv.Key, kv.Value);
+        }
+        finally { _rw.ExitReadLock(); }
+
+        for (int i = 0; i < snap.Length; i++)
+        {
+            var (k, v) = snap[i];
+
+            if (fromInclusive.Length != 0 && ByteCompare(k, fromInclusive) < 0) continue;
+            if (toExclusive.Length != 0 && ByteCompare(k, toExclusive) >= 0) break;
+            if (afterKeyExclusive is not null && afterKeyExclusive.Length != 0 &&
+                ByteCompare(k, afterKeyExclusive) <= 0) continue;
+
+            yield return (k, v);
         }
     }
 
+    private static int ByteCompare(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b)
+    {
+        int n = Math.Min(a.Length, b.Length);
+        for (int i = 0; i < n; i++) { int d = a[i] - b[i]; if (d != 0) return d; }
+        return a.Length - b.Length;
+    }
 }
