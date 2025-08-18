@@ -66,15 +66,17 @@ public sealed class WalnutDatabase : IDatabase
         {
             if (_uniqueGuards.TryGetValue(gk, out var existing))
             {
-                // Rezerwacja już istnieje:
-                // - jeśli to ten sam PK -> OK (idempotentnie)
-                // - inny PK -> kolizja
-                return ByteArrayEquals(existing, pk);
+                bool ok = ByteArrayEquals(existing, pk);
+                Diag.U($"RESERVE hit   idx={indexTableName} val={Diag.B64(valuePrefix)} owner={(ok ? "same" : "other")}");
+                return ok;
             }
 
             if (_uniqueGuards.TryAdd(gk, pk))
-                return true; // udało się zarezerwować
-            // mała kolizja przy Add -> pętla i sprawdź ponownie
+            {
+                Diag.U($"RESERVE add   idx={indexTableName} val={Diag.B64(valuePrefix)} pk={Diag.B64(pk)}");
+                return true;
+            }
+            // kolizja podczas Add — pętla
         }
     }
 
@@ -82,8 +84,14 @@ public sealed class WalnutDatabase : IDatabase
     {
         var gk = MakeGuardKey(indexTableName, valuePrefix);
         if (_uniqueGuards.TryGetValue(gk, out var cur) && ByteArrayEquals(cur, pk))
+        {
             _uniqueGuards.TryRemove(gk, out _);
-        // jeśli ktoś podmienił na inny PK (nie powinien), nie ściągamy
+            Diag.U($"RELEASE ok    idx={indexTableName} val={Diag.B64(valuePrefix)} pk={Diag.B64(pk)}");
+        }
+        else
+        {
+            Diag.U($"RELEASE skip  idx={indexTableName} val={Diag.B64(valuePrefix)} (not owner)");
+        }
     }
 
     private static bool ByteArrayEquals(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b)

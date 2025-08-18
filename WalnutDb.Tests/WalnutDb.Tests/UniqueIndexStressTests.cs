@@ -1,10 +1,4 @@
 ﻿#nullable enable
-using System;
-using System.Linq;
-using System.Threading;
-using System.Threading.Tasks;
-using System.Collections.Generic;
-
 using WalnutDb.Core;
 using WalnutDb.Wal;
 
@@ -32,6 +26,7 @@ public sealed class UniqueIndexStressTests
     {
         var dir = NewTempDir("stress-ux");
         await using var wal = new WalWriter(Path.Combine(dir, "wal.log"));
+        Diag.UniqueTrace = true; // włącz w teście: Diag.UniqueTrace = true;
         await using var db = new WalnutDatabase(dir, new DatabaseOptions(), new FileSystemManifestStore(dir), wal);
         var tbl = await db.OpenTableAsync(new TableOptions<UxStressUser> { GetId = u => u.Id });
 
@@ -103,4 +98,60 @@ public sealed class UniqueIndexStressTests
         foreach (var kv in dupCheck)
             Assert.True(kv.Value <= 1, $"Duplicate email in index: {kv.Key} count={kv.Value}");
     }
+
+    [Fact]
+    public async Task Unique_TwoDifferentPk_SameEmail_OnlyOneWins()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "WalnutDbTests", "uniq-race", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        Diag.UniqueTrace = true;
+
+        await using var wal = new WalWriter(Path.Combine(dir, "wal.log"));
+        await using var db = new WalnutDatabase(dir, new DatabaseOptions(), new FileSystemManifestStore(dir), wal);
+        var tbl = await db.OpenTableAsync(new TableOptions<UxStressUser> { GetId = u => u.Id });
+
+        var email = "e9999@ex.com";
+        var t1 = tbl.UpsertAsync(new UxStressUser { Id = "A", Email = email }).AsTask();
+        var t2 = tbl.UpsertAsync(new UxStressUser { Id = "B", Email = email }).AsTask();
+
+        await Task.WhenAll(Task.WhenAny(t1, t2));
+        var ok1 = t1.IsCompletedSuccessfully;
+        var ok2 = t2.IsCompletedSuccessfully;
+
+        await db.CheckpointAsync();
+
+        int cnt = 0;
+        await foreach (var u in tbl.ScanByIndexAsync("Email", default, default))
+            if (u.Email == email) cnt++;
+
+        Assert.True(cnt == 1, $"expected exactly one owner of {email}, got {cnt} (ok1={ok1}, ok2={ok2})");
+    }
+
+    [Fact]
+    public async Task Unique_RotateAndTake_OldOwnerReleases_NewOwnerTakes()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "WalnutDbTests", "uniq-rotate", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        Diag.UniqueTrace = true;
+
+        await using var wal = new WalWriter(Path.Combine(dir, "wal.log"));
+        await using var db = new WalnutDatabase(dir, new DatabaseOptions(), new FileSystemManifestStore(dir), wal);
+        var tbl = await db.OpenTableAsync(new TableOptions<UxStressUser> { GetId = u => u.Id });
+
+        await tbl.UpsertAsync(new UxStressUser { Id = "A", Email = "E" });
+
+        // A zmienia E→F, równolegle B próbuje wziąć E
+        var tA = tbl.UpsertAsync(new UxStressUser { Id = "A", Email = "F" }).AsTask();
+        var tB = tbl.UpsertAsync(new UxStressUser { Id = "B", Email = "E" }).AsTask();
+
+        await Task.WhenAll(tA.ContinueWith(_ => { }), tB.ContinueWith(_ => { }));
+        await db.CheckpointAsync();
+
+        var a = await tbl.GetAsync("A");
+        var b = await tbl.GetAsync("B");
+
+        Assert.Equal("F", a?.Email);
+        Assert.Equal("E", b?.Email);
+    }
+
 }

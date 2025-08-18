@@ -91,19 +91,17 @@ internal sealed class DefaultTable<T> : ITable<T>
     public ValueTask<bool> DeleteAsync(string id, ITransaction tx, CancellationToken ct = default)
         => DeleteAsync((object)id, tx, ct);
 
-
-    // ---------------- Explicit TX ----------------
-    public ValueTask<bool> UpsertAsync(T item, ITransaction txHandle, CancellationToken ct = default)
+    public async ValueTask<bool> UpsertAsync(T item, ITransaction txHandle, CancellationToken ct = default)
     {
         if (txHandle is not WalnutTransaction tx)
             throw new InvalidOperationException("Unknown transaction type.");
 
         var key = _map.GetKeyBytes(item);
-        var val = _map.Serialize(item);                         // plaintext do MEM
+        var val = _map.Serialize(item);                         // plaintext → MEM
         var enc = _db.Encryption;
-        var walVal = enc is null ? val : enc.Encrypt(val, _name, key); // ciphertext do WAL
+        var walVal = enc is null ? val : enc.Encrypt(val, _name, key); // ciphertext → WAL
 
-        // stary rekord z MEM (dla aktualizacji indeksów i optymalizacji checku)
+        // 1) Odczytaj „stary” rekord: najpierw MEM, a jeśli go nie ma — SST (z decryptem).
         bool hasOld = false;
         T old = default!;
         if (_memRef.Current.TryGet(key, out var rawOld) && rawOld is not null)
@@ -111,71 +109,95 @@ internal sealed class DefaultTable<T> : ITable<T>
             old = _map.Deserialize(rawOld);
             hasOld = true;
         }
-
-        // —— UNIKALNOŚĆ: rezerwacja + dotychczasowe checki —— //
-        var reservations = new List<(string IndexTable, byte[] Prefix)>(); // do zwolnienia po apply
-
-        foreach (var idx in _indexes)
+        else if (_db.TryGetFromSst(_name, key, out var sstVal) && sstVal is not null)
         {
-            if (!idx.Unique) continue;
-
-            var newValObj = idx.Extract(item);
-            if (newValObj is null) continue; // NULL nie podlega unikalności
-
-            // Jeśli to update i wartość się nie zmienia — teoretycznie można pominąć,
-            // ale dla bezpieczeństwa i tak robimy rezerwację, by wygasić race.
-            var newPrefix = IndexKeyCodec.Encode(newValObj, idx.DecimalScale);
-            var newIdxKey = IndexKeyCodec.ComposeIndexEntryKey(newPrefix, key);
-            var to = IndexKeyCodec.PrefixUpperBound(newPrefix);
-
-            // 0) REZERWACJA globalna – eliminuje race między równoległymi writerami
-            if (!_db.TryReserveUnique(idx.IndexTableName, newPrefix, key))
-                throw new InvalidOperationException($"Unique index '{idx.Name}' violation for value '{newValObj}'.");
-            reservations.Add((idx.IndexTableName, newPrefix));
-
-            // 1) MEM: czy już mamy dokładnie ten wpis (nasz PK)? → OK
-            foreach (var kv in idx.Mem.Current.SnapshotRange(newIdxKey, ExactUpperBound(newIdxKey), afterKeyExclusive: null))
-            {
-                if (!kv.Value.Tombstone)
-                {
-                    // to jest dokładnie (newPrefix|pk) → nasz własny wpis; OK
-                    goto AfterUniqueCheck;
-                }
-                break;
-            }
-
-            // 2) SST: dokładny wpis (newPrefix|pk) → też OK (po wcześniejszym checkpoint)
-            foreach (var kv in _db.ScanSstRange(idx.IndexTableName, newIdxKey, ExactUpperBound(newIdxKey)))
-            {
-                goto AfterUniqueCheck;
-            }
-
-            // 3) MEM: ktoś inny z tym prefixem?
-            foreach (var kv in idx.Mem.Current.SnapshotRange(newPrefix, to, afterKeyExclusive: null))
-            {
-                if (kv.Value.Tombstone) continue;
-                var existingPk = IndexKeyCodec.ExtractPrimaryKey(kv.Key);
-                if (!ByteArrayEquals(existingPk, key))
-                    throw new InvalidOperationException($"Unique index '{idx.Name}' violation for value '{newValObj}'.");
-            }
-
-            // 4) SST: ktoś inny z tym prefixem? (z szacunkiem dla tombstonów w MEM)
-            foreach (var kv in _db.ScanSstRange(idx.IndexTableName, newPrefix, to))
-            {
-                if (HasMemTombstone(idx.Mem.Current, kv.Key)) continue; // przykryty przez MEM-delete
-                var existingPk = IndexKeyCodec.ExtractPrimaryKey(kv.Key);
-                if (!ByteArrayEquals(existingPk, key))
-                    throw new InvalidOperationException($"Unique index '{idx.Name}' violation for value '{newValObj}'.");
-            }
-
-        AfterUniqueCheck:;
+            var payload = enc is null ? sstVal : enc.Decrypt(sstVal, _name, key);
+            old = _map.Deserialize(payload);
+            hasOld = true;
         }
 
-        // —— główny PUT —— //
-        tx.AddPut(_name, key, walVal);                       // do WAL idzie szyfr
-        tx.AddApply(() => _memRef.Current.Upsert(key, val)); // w MEM trzymamy plaintext
+        // 2) Unikalność – rezerwacje i checki.
+        //    NOWE: jeżeli rezerwacja nie wyjdzie, krótko czekamy i próbujemy ponownie (kilka razy).
+        var reservedNow = new List<(string IndexTable, byte[] Prefix)>();
+        try
+        {
+            foreach (var idx in _indexes)
+            {
+                if (!idx.Unique) continue;
 
-        // —— aktualizacja indeksów —— //
+                var newValObj = idx.Extract(item);
+                if (newValObj is null) continue; // NULL nie podlega unikalności
+
+                var newPrefix = IndexKeyCodec.Encode(newValObj, idx.DecimalScale);
+                var newIdxKey = IndexKeyCodec.ComposeIndexEntryKey(newPrefix, key);
+                var to = IndexKeyCodec.PrefixUpperBound(newPrefix);
+
+                // 2a) Rezerwacja globalna — retry krótki „wait until free”
+                const int maxAttempts = 12;          // ~ do kilkunastu tików
+                const int delayMicros = 200;         // lekki backoff (200 µs)
+                var attempt = 0;
+
+                // 2a) Rezerwacja globalna — retry z miękkim czekaniem do ~300 ms
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                var spin = new System.Threading.SpinWait();
+
+                while (!_db.TryReserveUnique(idx.IndexTableName, newPrefix, key))
+                {
+                    // Jeżeli rezerwacja jest zajęta przez „innego” właściciela,
+                    // poczekaj chwilę aż on zwolni (commit/apply) i spróbuj ponownie.
+                    ct.ThrowIfCancellationRequested();
+
+                    if (sw.Elapsed > TimeSpan.FromMilliseconds(300))
+                        throw new InvalidOperationException(
+                            $"Unique index '{idx.Name}' violation for value '{newValObj}'.");
+
+                    spin.SpinOnce();                // krótki aktywny spin
+                    if (spin.NextSpinWillYield)     // i gdy scheduler poprosi, oddaj kwant
+                        await Task.Delay(1, ct).ConfigureAwait(false);
+                }
+
+                reservedNow.Add((idx.IndexTableName, newPrefix));
+
+                // 2b) Idempotencja — jeśli dokładnie (prefix|pk) już jest (MEM/SST) → OK.
+                foreach (var kv in idx.Mem.Current.SnapshotRange(newIdxKey, ExactUpperBound(newIdxKey), afterKeyExclusive: null))
+                { if (!kv.Value.Tombstone) goto AfterUniqueCheck; break; }
+                foreach (var _ in _db.ScanSstRange(idx.IndexTableName, newIdxKey, ExactUpperBound(newIdxKey)))
+                { goto AfterUniqueCheck; }
+
+                // 2c) Ktoś inny z tym prefixem? (MEM – pomijaj tombstony)
+                foreach (var kv in idx.Mem.Current.SnapshotRange(newPrefix, to, afterKeyExclusive: null))
+                {
+                    if (kv.Value.Tombstone) continue;
+                    var existingPk = IndexKeyCodec.ExtractPrimaryKey(kv.Key);
+                    if (!ByteArrayEquals(existingPk, key))
+                        throw new InvalidOperationException($"Unique index '{idx.Name}' violation for value '{newValObj}'.");
+                }
+
+                // 2d) Ktoś inny z tym prefixem w SST (uszanuj tombstony w MEM)
+                foreach (var kv in _db.ScanSstRange(idx.IndexTableName, newPrefix, to))
+                {
+                    if (HasMemTombstone(idx.Mem.Current, kv.Key)) continue;
+                    var existingPk = IndexKeyCodec.ExtractPrimaryKey(kv.Key);
+                    if (!ByteArrayEquals(existingPk, key))
+                        throw new InvalidOperationException($"Unique index '{idx.Name}' violation for value '{newValObj}'.");
+                }
+
+            AfterUniqueCheck:;
+            }
+        }
+        catch
+        {
+            // Rolback rezerwacji z tej operacji
+            foreach (var (idxTable, prefix) in reservedNow)
+                _db.ReleaseUnique(idxTable, prefix, key);
+            throw;
+        }
+
+        // 3) Główny PUT
+        tx.AddPut(_name, key, walVal);
+        tx.AddApply(() => _memRef.Current.Upsert(key, val));
+
+        // 4) Aktualizacja indeksów (+ zwalnianie rezerwacji STAREJ wartości, jeśli zmieniona)
         foreach (var idx in _indexes)
         {
             var newValObj = idx.Extract(item);
@@ -186,27 +208,29 @@ internal sealed class DefaultTable<T> : ITable<T>
             {
                 var oldValObj = idx.Extract(old);
                 var oldPrefix = IndexKeyCodec.Encode(oldValObj, idx.DecimalScale);
+
                 if (!ByteArrayEquals(oldPrefix, newPrefix))
                 {
                     var oldIdxKey = IndexKeyCodec.ComposeIndexEntryKey(oldPrefix, key);
+
+                    // tombstone starego wpisu indeksu (ważne, gdy „stary” rekord był tylko w SST!)
                     tx.AddDelete(idx.IndexTableName, oldIdxKey);
-                    tx.AddApply(() => idx.Mem.Current.Delete(oldIdxKey)); // tombstone w MEM
+                    tx.AddApply(() => idx.Mem.Current.Delete(oldIdxKey));
+
+                    // zwolnij rezerwację STAREJ wartości po zastosowaniu tombstona
+                    var capturedIdx = idx.IndexTableName;
+                    var capturedOld = oldPrefix;
+                    tx.AddApply(() => _db.ReleaseUnique(capturedIdx, capturedOld, key));
                 }
             }
 
+            // zawsze zapisz nowy wpis indeksu
             tx.AddPut(idx.IndexTableName, newIdxKey, Array.Empty<byte>());
             tx.AddApply(() => idx.Mem.Current.Upsert(newIdxKey, Array.Empty<byte>()));
         }
 
-        // —— ZWOLNIENIE REZERWACJI po zastosowaniu zmian w MEM —— //
-        foreach (var (idxTable, prefix) in reservations)
-        {
-            var capturedIdx = idxTable;
-            var capturedPrefix = prefix;
-            tx.AddApply(() => _db.ReleaseUnique(capturedIdx, capturedPrefix, key));
-        }
-
-        return ValueTask.FromResult(true);
+        // „Nowych” rezerwacji nie zwalniamy — rekord posiada tę wartość.
+        return true;
     }
 
     public async ValueTask<bool> DeleteAsync(object id, ITransaction txHandle, CancellationToken ct = default)
@@ -224,19 +248,22 @@ internal sealed class DefaultTable<T> : ITable<T>
             old = _map.Deserialize(rawOld);
             hasOld = true;
         }
-        else
+        else if (_db.TryGetFromSst(_name, key, out var sstVal) && sstVal is not null)
         {
-            if (_db.TryGetFromSst(_name, key, out var sstVal) && sstVal is not null)
-            {
-                var enc = _db.Encryption;
-                var payload = (enc is null) ? sstVal : enc.Decrypt(sstVal, _name, key);
-                old = _map.Deserialize(payload);
-                hasOld = true;
-            }
+            var enc = _db.Encryption;
+            var payload = (enc is null) ? sstVal : enc.Decrypt(sstVal, _name, key);
+            old = _map.Deserialize(payload);
+            hasOld = true;
         }
 
+        Diag.U($"DELETE begin  table={_name} pk={Diag.B64(key)} hasOld={hasOld}");
+
         tx.AddDelete(_name, key);
-        tx.AddApply(() => _memRef.Current.Delete(key));
+        tx.AddApply(() =>
+        {
+            _memRef.Current.Delete(key);
+            Diag.U($"TABLE del    table={_name} pk={Diag.B64(key)}");
+        });
 
         if (hasOld)
         {
@@ -245,8 +272,21 @@ internal sealed class DefaultTable<T> : ITable<T>
                 var oldValObj = idx.Extract(old);
                 var oldPrefix = IndexKeyCodec.Encode(oldValObj, idx.DecimalScale);
                 var oldIdxKey = IndexKeyCodec.ComposeIndexEntryKey(oldPrefix, key);
+
                 tx.AddDelete(idx.IndexTableName, oldIdxKey);
-                tx.AddApply(() => idx.Mem.Current.Delete(oldIdxKey));
+                tx.AddApply(() =>
+                {
+                    idx.Mem.Current.Delete(oldIdxKey);
+                    Diag.U($"IDX del      idx={idx.IndexTableName} old={Diag.B64(oldPrefix)} pk={Diag.B64(key)}");
+                });
+
+                var capturedIdx = idx.IndexTableName;
+                var capturedOld = oldPrefix;
+                tx.AddApply(() =>
+                {
+                    _db.ReleaseUnique(capturedIdx, capturedOld, key);
+                    Diag.U($"UNIQ free    idx={capturedIdx} old={Diag.B64(capturedOld)} pk={Diag.B64(key)}");
+                });
             }
         }
 
@@ -260,13 +300,19 @@ internal sealed class DefaultTable<T> : ITable<T>
 
         var key = _map.GetKeyBytes(item);
 
-        bool hasOld = true;
+        bool hasOld = true; // użyjemy wartości z item jeśli nie ma w MEM
         T old = item;
         if (_memRef.Current.TryGet(key, out var rawOld) && rawOld is not null)
             old = _map.Deserialize(rawOld);
 
+        Diag.U($"DELETE begin  table={_name} pk={Diag.B64(key)} hasOld={hasOld}");
+
         tx.AddDelete(_name, key);
-        tx.AddApply(() => _memRef.Current.Delete(key));
+        tx.AddApply(() =>
+        {
+            _memRef.Current.Delete(key);
+            Diag.U($"TABLE del    table={_name} pk={Diag.B64(key)}");
+        });
 
         if (hasOld)
         {
@@ -275,8 +321,21 @@ internal sealed class DefaultTable<T> : ITable<T>
                 var oldValObj = idx.Extract(old);
                 var oldPrefix = IndexKeyCodec.Encode(oldValObj, idx.DecimalScale);
                 var oldIdxKey = IndexKeyCodec.ComposeIndexEntryKey(oldPrefix, key);
+
                 tx.AddDelete(idx.IndexTableName, oldIdxKey);
-                tx.AddApply(() => idx.Mem.Current.Delete(oldIdxKey));
+                tx.AddApply(() =>
+                {
+                    idx.Mem.Current.Delete(oldIdxKey);
+                    Diag.U($"IDX del      idx={idx.IndexTableName} old={Diag.B64(oldPrefix)} pk={Diag.B64(key)}");
+                });
+
+                var capturedIdx = idx.IndexTableName;
+                var capturedOld = oldPrefix;
+                tx.AddApply(() =>
+                {
+                    _db.ReleaseUnique(capturedIdx, capturedOld, key);
+                    Diag.U($"UNIQ free    idx={capturedIdx} old={Diag.B64(capturedOld)} pk={Diag.B64(key)}");
+                });
             }
         }
 
