@@ -15,6 +15,9 @@ internal sealed class WalnutTransaction : WalnutDb.ITransaction
     private readonly List<ReadOnlyMemory<byte>> _frames = new();
     // A tutaj akcje do zastosowania w MemTable po commit
     private readonly List<Action> _applyActions = new();
+    // Akcje uruchamiane przy Dispose, gdy transakcja nie została zatwierdzona
+    private readonly List<Action> _rollbackActions = new();
+    private bool _committed;
 
     internal WalnutTransaction(WalnutDatabase db, ulong txId, ulong seqNo)
     {
@@ -38,6 +41,7 @@ internal sealed class WalnutTransaction : WalnutDb.ITransaction
         try
         {
             foreach (var act in _applyActions) act();
+            _committed = true;
         }
         finally
         {
@@ -45,11 +49,16 @@ internal sealed class WalnutTransaction : WalnutDb.ITransaction
         }
     }
 
-    public void Dispose() { /* brak Commit => brak efektu */ }
+    public void Dispose()
+    {
+        if (!_committed)
+            foreach (var act in _rollbackActions) act();
+    }
     public ValueTask DisposeAsync() { Dispose(); return ValueTask.CompletedTask; }
 
     // ---- używane przez DefaultTable<T> ----
     internal void AddApply(Action action) => _applyActions.Add(action);
+    internal void AddRollback(Action action) => _rollbackActions.Add(action);
     internal void AddPut(string table, byte[] key, byte[] value)
     {
         _frames.Add(Wal.WalCodec.BuildPut(_txId, table, key, value));

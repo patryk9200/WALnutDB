@@ -159,6 +159,10 @@ internal sealed class DefaultTable<T> : ITable<T>
                 }
 
                 reservedNow.Add((idx.IndexTableName, newPrefix));
+                // jeśli transakcja zostanie porzucona, zwolnij rezerwację
+                var capturedIdx = idx.IndexTableName;
+                var capturedPrefix = newPrefix;
+                tx.AddRollback(() => _db.ReleaseUnique(capturedIdx, capturedPrefix, key));
 
                 // 2b) Idempotencja — jeśli dokładnie (prefix|pk) już jest (MEM/SST) → OK.
                 foreach (var kv in idx.Mem.Current.SnapshotRange(newIdxKey, ExactUpperBound(newIdxKey), afterKeyExclusive: null))
