@@ -26,6 +26,27 @@ public sealed class ConcurrentRwStressTests
     }
 
     [Fact]
+    public async Task Read_DoesNotResurrect_Deleted_Row_Against_SST()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "WalnutDbTests", "ghost", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        await using var wal = new WalWriter(Path.Combine(dir, "wal.log"));
+        await using var db = new WalnutDatabase(dir, new DatabaseOptions(), new FileSystemManifestStore(dir), wal);
+
+        var tbl = await db.OpenTableAsync(new TableOptions<(string Id, int V)> { GetId = x => x.Id });
+        await tbl.UpsertAsync(("k1", 123));
+        await db.CheckpointAsync();             // przenieś do SST
+        await tbl.DeleteAsync("k1");            // tombstone w MEM, SST ma jeszcze starą wartość
+
+        Assert.Null(await tbl.GetAsync("k1"));  // bez tej łatki mógł wracać obiekt
+        int seen = 0;
+        await foreach (var _ in tbl.GetAllAsync()) seen++;
+        // nie powinien pokazać "k1" w skanie
+        Assert.Equal(0, seen);
+    }
+
+
+    [Fact]
     public async Task Concurrent_Writes_Reads_With_Checkpoints_Match_Final_State()
     {
         var dir = NewTempDir("stress-rw");

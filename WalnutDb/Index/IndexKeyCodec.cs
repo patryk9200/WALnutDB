@@ -155,6 +155,17 @@ public static class IndexKeyCodec
         g.TryWriteBytes(buf);
         return buf;
     }
+
+    public static byte[] ExtractValuePrefix(ReadOnlySpan<byte> compositeKey)
+    {
+        var pk = ExtractPrimaryKey(compositeKey.ToArray());
+        int prefixLen = compositeKey.Length - pk.Length;
+        if (prefixLen <= 0) return Array.Empty<byte>();
+        var prefix = new byte[prefixLen];
+        compositeKey.Slice(0, prefixLen).CopyTo(prefix);
+        return prefix;
+    }
+
     public static byte[]? NextPrefix(ReadOnlySpan<byte> prefix)
     {
         if (prefix.Length == 0) return Array.Empty<byte>(); // „> cokolwiek” – więc brak prefiksu => unbounded

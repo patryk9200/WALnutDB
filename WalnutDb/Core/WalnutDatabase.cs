@@ -1,9 +1,10 @@
 ﻿using System.Collections.Concurrent;
-using System.Runtime.InteropServices;
-using WalnutDb.Sst;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Text;
 
+using WalnutDb.Indexing;
+using WalnutDb.Sst;
 using WalnutDb.Wal;
 
 namespace WalnutDb.Core;
@@ -50,6 +51,39 @@ public sealed class WalnutDatabase : IDatabase
             var logicalName = DecodeNameFromFile(baseName);
             try { _sst[logicalName] = new SstReader(file); } catch { /* ignore */ }
         }
+
+        try
+        {
+            foreach (var name in _tables.Keys.Concat(_sst.Keys).Distinct())
+            {
+                if (!name.StartsWith("__index__", StringComparison.Ordinal)) continue;
+
+                // MEM
+                if (_tables.TryGetValue(name, out var memRef))
+                {
+                    foreach (var it in memRef.Current.SnapshotAll(null))
+                    {
+                        if (it.Value.Tombstone) continue;
+                        var prefix = IndexKeyCodec.ExtractValuePrefix(it.Key); // dodaj albo użyj swojego sposobu
+                        var pk = IndexKeyCodec.ExtractPrimaryKey(it.Key);
+                        TryReserveUnique(name, prefix, pk); // bez logów, best-effort
+                    }
+                }
+
+                // SST
+                if (_sst.TryGetValue(name, out var sst))
+                {
+                    foreach (var (k, _) in sst.ScanRange(Array.Empty<byte>(), Array.Empty<byte>()))
+                    {
+                        var prefix = IndexKeyCodec.ExtractValuePrefix(k);
+                        var pk = IndexKeyCodec.ExtractPrimaryKey(k);
+                        TryReserveUnique(name, prefix, pk);
+                    }
+                }
+            }
+        }
+        catch { /* seed jest best-effort */ }
+
     }
 
     // --- REZERWACJE UNIKALNE (dla indeksów Unique) ---
@@ -180,20 +214,67 @@ public sealed class WalnutDatabase : IDatabase
     internal bool TryGetFromSst(string name, ReadOnlySpan<byte> key, out byte[]? value)
     {
         value = null;
-        try
+
+        // Krótki retry w razie wyścigu z ReplaceSst (ObjectDisposed/IO)
+        for (int attempt = 0; attempt < 3; attempt++)
         {
-            if (_sst.TryGetValue(name, out var sst))
-                return sst.TryGet(key, out value);
+            try
+            {
+                if (_sst.TryGetValue(name, out var sst))
+                    return sst.TryGet(key, out value);
+                return false;
+            }
+            catch (IOException)
+            {
+                // chwilowo podmieniany plik – spróbuj ponownie
+            }
+            catch (ObjectDisposedException)
+            {
+                // stary reader został właśnie wymieniony – spróbuj ponownie
+            }
+
+            // króciutka pauza zanim sprawdzimy jeszcze raz
+            System.Threading.Thread.SpinWait(64);
         }
-        catch (IOException) { /* plik był akurat podmieniany — potraktuj jak „brak” */ }
-        catch (ObjectDisposedException) { /* stary reader – potraktuj jak „brak” */ }
+
+        return false;
+    }
+
+    // Klucz: "<indexTableName>|<b64(valuePrefix)>"
+    private static string MakeGuardKey(string indexTableName, ReadOnlySpan<byte> valuePrefix)
+        => indexTableName + "|" + Convert.ToBase64String(valuePrefix);
+
+    // już masz wersję byte[]; obie mogą współistnieć
+
+    internal bool IsUniqueOwner(string indexTableName, ReadOnlySpan<byte> prefix, ReadOnlySpan<byte> pk)
+    {
+        var gk = MakeGuardKey(indexTableName, prefix);
+        if (_uniqueGuards.TryGetValue(gk, out var owner))
+        {
+            bool ok = ByteArrayEquals(owner, pk);
+            if (Diag.UniqueTrace)
+                Diag.U($"OWNER chk   idx={indexTableName} val={Diag.B64(prefix.ToArray())} me={Diag.B64(pk.ToArray())} ok={ok}");
+            return ok;
+        }
+        if (Diag.UniqueTrace)
+            Diag.U($"OWNER chk   idx={indexTableName} val={Diag.B64(prefix.ToArray())} me={Diag.B64(pk.ToArray())} ok=false (no owner)");
         return false;
     }
 
     internal IEnumerable<(byte[] Key, byte[] Val)> ScanSstRange(string name, byte[] fromInclusive, byte[] toExclusive)
     {
-        if (_sst.TryGetValue(name, out var sst))
-            return sst.ScanRange(fromInclusive, toExclusive);
+        for (int attempt = 0; attempt < 3; attempt++)
+        {
+            try
+            {
+                if (_sst.TryGetValue(name, out var sst))
+                    return sst.ScanRange(fromInclusive, toExclusive);
+                return Array.Empty<(byte[] Key, byte[] Val)>();
+            }
+            catch (IOException) { }
+            catch (ObjectDisposedException) { }
+            System.Threading.Thread.SpinWait(64);
+        }
         return Array.Empty<(byte[] Key, byte[] Val)>();
     }
 
@@ -637,15 +718,48 @@ public sealed class WalnutDatabase : IDatabase
     {
         private readonly DatabaseOptions _opt;
         public DefaultTypeNameResolver(DatabaseOptions opt) { _opt = opt; }
+
         public string Resolve(Type t)
         {
-            return _opt.TypeNaming switch
+            // Bazowa nazwa zgodnie z konfiguracją (jak dotąd)
+            string baseName = _opt.TypeNaming switch
             {
                 TypeNamingStrategy.TypeFullName => t.FullName ?? t.Name,
                 TypeNamingStrategy.TypeNameOnly => t.Name,
                 TypeNamingStrategy.AssemblyQualifiedNoVer => $"{t.Namespace}.{t.Name}, {t.Assembly.GetName().Name}",
                 _ => t.FullName ?? t.Name
             };
+
+            // 1) Znormalizuj nazwy generyków/tupli: obetnij listę argumentów ([...])
+            int bracket = baseName.IndexOf('[');
+            if (bracket >= 0)
+                baseName = baseName.Substring(0, bracket);
+
+            // 2) Dodaj arność dla generyków (np. ValueTuple`2)
+            if (t.IsGenericType && !baseName.Contains('`'))
+                baseName += $"`{t.GetGenericArguments().Length}";
+
+            // 3) Uczyń nazwę krótką i unikalną: dodaj krótki hash typu (AQN daje stabilny podpis)
+            string sig = t.AssemblyQualifiedName ?? (t.FullName ?? t.Name);
+            string hash8 = ToShortHash(sig); // 8 hex (32 bity)
+
+            string shortName = $"{baseName}-{hash8}";
+
+            // 4) Ostatecznie, jeśli i tak jest długa, przytnij do sensownego limitu (np. 64 znaki)
+            if (shortName.Length > 64)
+                shortName = shortName.Substring(0, 64);
+
+            return shortName;
+        }
+
+        private static string ToShortHash(string s)
+        {
+            using var sha1 = System.Security.Cryptography.SHA1.Create();
+            var bytes = System.Text.Encoding.UTF8.GetBytes(s);
+            var h = sha1.ComputeHash(bytes);
+            // 4 bajty → 8 znaków hex; wystarczająco mało i stabilnie
+            return Convert.ToHexString(h, 0, 4).ToLowerInvariant();
         }
     }
+
 }
