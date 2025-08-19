@@ -13,4 +13,10 @@ public sealed class DbIndexAttribute : Attribute
         Name = name;
         DecimalScale = decimalScale;
     }
+    public DbIndexAttribute(string name, bool unique, int decimalScale)
+    {
+        Name = name;
+        Unique = unique;
+        DecimalScale = decimalScale;
+    }
 }
