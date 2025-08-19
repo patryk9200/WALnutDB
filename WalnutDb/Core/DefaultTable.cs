@@ -505,7 +505,6 @@ internal sealed class DefaultTable<T> : ITable<T>
             }
         }
     }
-
     public async IAsyncEnumerable<T> ScanByIndexAsync(
     IndexHint hint,
     int pageSize = 1024,
@@ -529,6 +528,21 @@ internal sealed class DefaultTable<T> : ITable<T>
         int sent = 0;
         byte[]? lastKey = null;
 
+        // Lokalny filtr: czy Entry z indeksu odpowiada aktualnej wartości indeksowanej w obiekcie
+        bool MatchesCurrentIndexValue(byte[] indexEntryKey, T obj)
+        {
+            var curValObj = idx.Extract(obj);
+            if (curValObj is null) return false; // obiekt nie ma już wartości dla tego indeksu → wpis jest nieaktualny
+
+            var curPrefix = IndexKeyCodec.Encode(curValObj, idx.DecimalScale);
+            if (curPrefix.Length == 0) return false; // nasze indeksy nie trzymają null/empty; potraktuj jako brak
+
+            var upper = IndexKeyCodec.PrefixUpperBound(curPrefix); // może być [] = +∞
+            if (ByteCompare(indexEntryKey, curPrefix) < 0) return false;
+            if (upper.Length != 0 && ByteCompare(indexEntryKey, upper) >= 0) return false;
+            return true;
+        }
+
         if (hint.Asc)
         {
             int skipped = 0, yielded = 0;
@@ -542,11 +556,12 @@ internal sealed class DefaultTable<T> : ITable<T>
                 if (useMem)
                 {
                     var rec = memEnum.Current; hasMem = memEnum.MoveNext();
+
                     if (!rec.Value.Tombstone && (after is null || ByteCompare(rec.Key, after) > 0))
                     {
                         var pk = IndexKeyCodec.ExtractPrimaryKey(rec.Key);
                         var obj = await GetAsync((object)pk, ct).ConfigureAwait(false);
-                        if (obj is not null)
+                        if (obj is not null && MatchesCurrentIndexValue(rec.Key, obj))
                         {
                             if (hint.Skip > 0 && skipped < hint.Skip) { skipped++; }
                             else
@@ -558,6 +573,7 @@ internal sealed class DefaultTable<T> : ITable<T>
                             }
                         }
                     }
+
                     lastKey = rec.Key;
                     if (hasSst && lastKey is not null && ByteCompare(lastKey, sstEnum.Current.Key) == 0)
                         hasSst = sstEnum.MoveNext();
@@ -565,12 +581,13 @@ internal sealed class DefaultTable<T> : ITable<T>
                 else
                 {
                     var rec = sstEnum.Current; hasSst = sstEnum.MoveNext();
+
                     if (HasMemTombstone(idx.Mem.Current, rec.Key)) continue;
                     if (after is not null && ByteCompare(rec.Key, after) <= 0) continue;
 
                     var pk = IndexKeyCodec.ExtractPrimaryKey(rec.Key);
                     var obj = await GetAsync((object)pk, ct).ConfigureAwait(false);
-                    if (obj is not null)
+                    if (obj is not null && MatchesCurrentIndexValue(rec.Key, obj))
                     {
                         if (hint.Skip > 0 && skipped < hint.Skip) { skipped++; }
                         else
@@ -586,7 +603,7 @@ internal sealed class DefaultTable<T> : ITable<T>
             yield break;
         }
 
-        // DESC — zbierz „ogon” do bufora pierścieniowego i odwróć.
+        // DESC — zbieramy do bufora i zwracamy w odwrotnej kolejności
         var cap = hint.Take is int t ? (hint.Skip + t) : int.MaxValue;
         var ring = new LinkedList<T>();
 
@@ -598,16 +615,18 @@ internal sealed class DefaultTable<T> : ITable<T>
             if (useMem)
             {
                 var rec = memEnum.Current; hasMem = memEnum.MoveNext();
+
                 if (!rec.Value.Tombstone && (after is null || ByteCompare(rec.Key, after) > 0))
                 {
                     var pk = IndexKeyCodec.ExtractPrimaryKey(rec.Key);
                     var obj = await GetAsync((object)pk, ct).ConfigureAwait(false);
-                    if (obj is not null)
+                    if (obj is not null && MatchesCurrentIndexValue(rec.Key, obj))
                     {
                         ring.AddLast(obj);
                         if (ring.Count > cap) ring.RemoveFirst();
                     }
                 }
+
                 lastKey = rec.Key;
                 if (hasSst && lastKey is not null && ByteCompare(lastKey, sstEnum.Current.Key) == 0)
                     hasSst = sstEnum.MoveNext();
@@ -615,12 +634,13 @@ internal sealed class DefaultTable<T> : ITable<T>
             else
             {
                 var rec = sstEnum.Current; hasSst = sstEnum.MoveNext();
+
                 if (HasMemTombstone(idx.Mem.Current, rec.Key)) continue;
                 if (after is not null && ByteCompare(rec.Key, after) <= 0) continue;
 
                 var pk = IndexKeyCodec.ExtractPrimaryKey(rec.Key);
                 var obj = await GetAsync((object)pk, ct).ConfigureAwait(false);
-                if (obj is not null)
+                if (obj is not null && MatchesCurrentIndexValue(rec.Key, obj))
                 {
                     ring.AddLast(obj);
                     if (ring.Count > cap) ring.RemoveFirst();
