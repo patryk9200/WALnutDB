@@ -54,5 +54,9 @@ Roadmap: online compaction/defrag stats &amp; swap, unique index enforcement, op
       <PackagePath>.\</PackagePath>
     </None>
   </ItemGroup>
+  <ItemGroup>
+    <Folder Include="Documentation\EN\" />
+    <Folder Include="Documentation\PL\" />
+  </ItemGroup>
 
 </Project>

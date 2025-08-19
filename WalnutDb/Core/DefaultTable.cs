@@ -531,11 +531,7 @@ internal sealed class DefaultTable<T> : ITable<T>
 
         if (hint.Asc)
         {
-            // SEEN-PFX: deduplikacja po prefiksie wartości (np. Email)
-            var seenPrefixes = new HashSet<string>(StringComparer.Ordinal);
-
-            int skipped = 0;
-            int yielded = 0;
+            int skipped = 0, yielded = 0;
             int? limit = hint.Take;
 
             while (hasMem || hasSst)
@@ -546,55 +542,31 @@ internal sealed class DefaultTable<T> : ITable<T>
                 if (useMem)
                 {
                     var rec = memEnum.Current; hasMem = memEnum.MoveNext();
-                    if (!rec.Value.Tombstone)
+                    if (!rec.Value.Tombstone && (after is null || ByteCompare(rec.Key, after) > 0))
                     {
-                        // SnapshotRange już respektuje 'after', ale zachowujemy check
-                        if (after is null || ByteCompare(rec.Key, after) > 0)
+                        var pk = IndexKeyCodec.ExtractPrimaryKey(rec.Key);
+                        var obj = await GetAsync((object)pk, ct).ConfigureAwait(false);
+                        if (obj is not null)
                         {
-                            // SEEN-PFX (MEM)
-                            var pfx = IndexKeyCodec.ExtractValuePrefix(rec.Key);
-                            var pSig = Convert.ToBase64String(pfx);
-                            if (!seenPrefixes.Contains(pSig))
+                            if (hint.Skip > 0 && skipped < hint.Skip) { skipped++; }
+                            else
                             {
-                                seenPrefixes.Add(pSig);
-
-                                var pk = IndexKeyCodec.ExtractPrimaryKey(rec.Key);
-                                var obj = await GetAsync((object)pk, ct).ConfigureAwait(false);
-                                if (obj is not null)
-                                {
-                                    if (hint.Skip > 0 && skipped < hint.Skip) { skipped++; }
-                                    else
-                                    {
-                                        yield return obj;
-                                        yielded++;
-                                        if (++sent >= pageSize) { sent = 0; await Task.Yield(); }
-                                        if (limit is int l && yielded >= l) yield break;
-                                    }
-                                }
+                                yield return obj;
+                                yielded++;
+                                if (++sent >= pageSize) { sent = 0; await Task.Yield(); }
+                                if (limit is int l && yielded >= l) yield break;
                             }
                         }
-                        lastKey = rec.Key;
                     }
+                    lastKey = rec.Key;
                     if (hasSst && lastKey is not null && ByteCompare(lastKey, sstEnum.Current.Key) == 0)
                         hasSst = sstEnum.MoveNext();
                 }
                 else
                 {
                     var rec = sstEnum.Current; hasSst = sstEnum.MoveNext();
-
-                    // Nie pokazuj wpisów przykrytych przez tombstone w MEM
                     if (HasMemTombstone(idx.Mem.Current, rec.Key)) continue;
-
-                    if (after is not null && ByteCompare(rec.Key, after) <= 0)
-                        continue;
-
-                    // SEEN-PFX (SST)
-                    var pfx = IndexKeyCodec.ExtractValuePrefix(rec.Key);
-                    var pSig = Convert.ToBase64String(pfx);
-                    if (seenPrefixes.Contains(pSig))
-                        continue;
-
-                    seenPrefixes.Add(pSig);
+                    if (after is not null && ByteCompare(rec.Key, after) <= 0) continue;
 
                     var pk = IndexKeyCodec.ExtractPrimaryKey(rec.Key);
                     var obj = await GetAsync((object)pk, ct).ConfigureAwait(false);
@@ -614,11 +586,9 @@ internal sealed class DefaultTable<T> : ITable<T>
             yield break;
         }
 
-        // DESC – bufor końcówki
+        // DESC — zbierz „ogon” do bufora pierścieniowego i odwróć.
         var cap = hint.Take is int t ? (hint.Skip + t) : int.MaxValue;
         var ring = new LinkedList<T>();
-        // SEEN-PFX dla trybu DESC
-        var seenPrefixesDesc = new HashSet<string>(StringComparer.Ordinal);
 
         while (hasMem || hasSst)
         {
@@ -628,28 +598,17 @@ internal sealed class DefaultTable<T> : ITable<T>
             if (useMem)
             {
                 var rec = memEnum.Current; hasMem = memEnum.MoveNext();
-                if (!rec.Value.Tombstone)
+                if (!rec.Value.Tombstone && (after is null || ByteCompare(rec.Key, after) > 0))
                 {
-                    if (after is null || ByteCompare(rec.Key, after) > 0)
+                    var pk = IndexKeyCodec.ExtractPrimaryKey(rec.Key);
+                    var obj = await GetAsync((object)pk, ct).ConfigureAwait(false);
+                    if (obj is not null)
                     {
-                        // SEEN-PFX (MEM, DESC)
-                        var pfx = IndexKeyCodec.ExtractValuePrefix(rec.Key);
-                        var pSig = Convert.ToBase64String(pfx);
-                        if (!seenPrefixesDesc.Contains(pSig))
-                        {
-                            seenPrefixesDesc.Add(pSig);
-
-                            var pk = IndexKeyCodec.ExtractPrimaryKey(rec.Key);
-                            var obj = await GetAsync((object)pk, ct).ConfigureAwait(false);
-                            if (obj is not null)
-                            {
-                                ring.AddLast(obj);
-                                if (ring.Count > cap) ring.RemoveFirst();
-                            }
-                        }
+                        ring.AddLast(obj);
+                        if (ring.Count > cap) ring.RemoveFirst();
                     }
-                    lastKey = rec.Key;
                 }
+                lastKey = rec.Key;
                 if (hasSst && lastKey is not null && ByteCompare(lastKey, sstEnum.Current.Key) == 0)
                     hasSst = sstEnum.MoveNext();
             }
@@ -657,17 +616,7 @@ internal sealed class DefaultTable<T> : ITable<T>
             {
                 var rec = sstEnum.Current; hasSst = sstEnum.MoveNext();
                 if (HasMemTombstone(idx.Mem.Current, rec.Key)) continue;
-
-                if (after is not null && ByteCompare(rec.Key, after) <= 0)
-                    continue;
-
-                // SEEN-PFX (SST, DESC)
-                var pfx = IndexKeyCodec.ExtractValuePrefix(rec.Key);
-                var pSig = Convert.ToBase64String(pfx);
-                if (seenPrefixesDesc.Contains(pSig))
-                    continue;
-
-                seenPrefixesDesc.Add(pSig);
+                if (after is not null && ByteCompare(rec.Key, after) <= 0) continue;
 
                 var pk = IndexKeyCodec.ExtractPrimaryKey(rec.Key);
                 var obj = await GetAsync((object)pk, ct).ConfigureAwait(false);
