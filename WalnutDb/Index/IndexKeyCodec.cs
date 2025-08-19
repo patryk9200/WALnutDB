@@ -64,6 +64,21 @@ public static class IndexKeyCodec
         return dst;
     }
 
+    // IndexKeyCodec.cs
+    public static byte[] ExtractValuePrefix(byte[] compositeKey)
+    {
+        var pk = ExtractPrimaryKey(compositeKey);
+
+        // ⬇⬇⬇ odejmij jeszcze 2 bajty długości PK
+        var prefixLen = compositeKey.Length - pk.Length - 2;
+        if (prefixLen < 0) prefixLen = 0;
+
+        var prefix = new byte[prefixLen];
+        Buffer.BlockCopy(compositeKey, 0, prefix, 0, prefixLen);
+        return prefix;
+    }
+
+    // i upewnij się, że ExtractPrimaryKey czyta ostatnie 2 bajty:
     public static byte[] ExtractPrimaryKey(ReadOnlySpan<byte> composite)
     {
         if (composite.Length < 2) return Array.Empty<byte>();
@@ -72,8 +87,6 @@ public static class IndexKeyCodec
         if (pkStart < 0) return Array.Empty<byte>();
         return composite.Slice(pkStart, pkLen).ToArray();
     }
-
-    // --- helpers ---
 
     private static byte[] U16(ushort v) { var b = new byte[2]; BinaryPrimitives.WriteUInt16BigEndian(b, v); return b; }
     private static byte[] U32(uint v) { var b = new byte[4]; BinaryPrimitives.WriteUInt32BigEndian(b, v); return b; }
@@ -154,15 +167,6 @@ public static class IndexKeyCodec
         var buf = new byte[16];
         g.TryWriteBytes(buf);
         return buf;
-    }
-
-    // IndexKeyCodec.cs
-    public static byte[] ExtractValuePrefix(ReadOnlySpan<byte> composite)
-    {
-        var pk = ExtractPrimaryKey(composite);
-        int prefixLen = composite.Length - pk.Length - 2; // <- brakujące -2
-        if (prefixLen < 0) prefixLen = 0;
-        return composite.Slice(0, prefixLen).ToArray();
     }
 
     public static byte[]? NextPrefix(ReadOnlySpan<byte> prefix)
