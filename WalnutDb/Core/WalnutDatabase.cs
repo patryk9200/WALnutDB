@@ -101,13 +101,13 @@ public sealed class WalnutDatabase : IDatabase
             if (_uniqueGuards.TryGetValue(gk, out var existing))
             {
                 bool ok = ByteArrayEquals(existing, pk);
-                Diag.U($"RESERVE hit   idx={indexTableName} val={Diag.B64(valuePrefix)} owner={(ok ? "same" : "other")}");
+                //Diag.U($"RESERVE hit   idx={indexTableName} val={Diag.B64(valuePrefix)} owner={(ok ? "same" : "other")}");
                 return ok;
             }
 
             if (_uniqueGuards.TryAdd(gk, pk))
             {
-                Diag.U($"RESERVE add   idx={indexTableName} val={Diag.B64(valuePrefix)} pk={Diag.B64(pk)}");
+                //Diag.U($"RESERVE add   idx={indexTableName} val={Diag.B64(valuePrefix)} pk={Diag.B64(pk)}");
                 return true;
             }
             // kolizja podczas Add — pętla
@@ -120,11 +120,11 @@ public sealed class WalnutDatabase : IDatabase
         if (_uniqueGuards.TryGetValue(gk, out var cur) && ByteArrayEquals(cur, pk))
         {
             _uniqueGuards.TryRemove(gk, out _);
-            Diag.U($"RELEASE ok    idx={indexTableName} val={Diag.B64(valuePrefix)} pk={Diag.B64(pk)}");
+            //Diag.U($"RELEASE ok    idx={indexTableName} val={Diag.B64(valuePrefix)} pk={Diag.B64(pk)}");
         }
         else
         {
-            Diag.U($"RELEASE skip  idx={indexTableName} val={Diag.B64(valuePrefix)} (not owner)");
+            //Diag.U($"RELEASE skip  idx={indexTableName} val={Diag.B64(valuePrefix)} (not owner)");
         }
     }
 
@@ -244,10 +244,12 @@ public sealed class WalnutDatabase : IDatabase
     private static string MakeGuardKey(string indexTableName, ReadOnlySpan<byte> valuePrefix)
         => indexTableName + "|" + Convert.ToBase64String(valuePrefix);
 
-    internal bool IsUniqueOwner(string indexTableName, byte[] valuePrefix, byte[] pk)
+    internal bool IsUniqueOwner(string indexTableName, ReadOnlySpan<byte> prefix, ReadOnlySpan<byte> pk)
     {
-        var gk = indexTableName + "|" + Convert.ToBase64String(valuePrefix);
-        return _uniqueGuards.TryGetValue(gk, out var owner) && ByteArrayEquals(owner, pk);
+        var gk = MakeGuardKey(indexTableName, prefix.ToArray());
+        if (_uniqueGuards.TryGetValue(gk, out var owner))
+            return ByteArrayComparer.Instance.Equals(owner, pk.ToArray());
+        return false;
     }
 
     internal IEnumerable<(byte[] Key, byte[] Val)> ScanSstRange(string name, byte[] fromInclusive, byte[] toExclusive)
@@ -318,44 +320,79 @@ public sealed class WalnutDatabase : IDatabase
 
         var enc = Encryption; // może być null
 
-        // 2) Dla każdej tabeli zbuduj nowy SST = (oldMem LIVE ∪ (stary SST \ covered))
+        // 2) Dla każdej tabeli zbuduj nowy SST
         foreach (var (name, oldMem) in snapshot)
         {
             ct.ThrowIfCancellationRequested();
 
-            var list = new List<(byte[] Key, byte[] Val)>(capacity: 1024);
-            var covered = new HashSet<string>(StringComparer.Ordinal); // klucze obecne w oldMem (żywe i tombstony)
+            bool isIndex = name.StartsWith("__index__", StringComparison.Ordinal);
 
-            // 2a) Zbierz wpisy z oldMem: do covered trafiają wszystkie klucze (żywe i tombstone),
-            //     do listy trafiają tylko żywe wartości (Value != null && !Tombstone).
+            // exact klucze obecne w RAM (żywe lub tombstone) – dzięki temu nie przeniesiemy tych samych
+            var coveredExact = new HashSet<string>(StringComparer.Ordinal);
+
+            // OUT:
+            // - dla zwykłych tabel: zwykła lista par (Key,Val)
+            // - dla indeksów: po JEDNYM wpisie na prefix wartości (np. e-mail)
+            List<(byte[] Key, byte[] Val)> outList = isIndex ? null! : new List<(byte[] Key, byte[] Val)>(capacity: 1024);
+            Dictionary<string, (byte[] Key, byte[] Val)> outByPrefix = isIndex ? new(StringComparer.Ordinal) : null!;
+
+            // 2a) Z RAM – zbierz exact (do covered) i żywe wpisy do OUT
             foreach (var it in oldMem.SnapshotAll(afterKeyExclusive: null))
             {
-                var sig = Convert.ToBase64String(it.Key);
-                covered.Add(sig);
+                var exactSig = Convert.ToBase64String(it.Key);
+                coveredExact.Add(exactSig);
 
-                if (!it.Value.Tombstone && it.Value.Value is not null)
+                if (it.Value.Tombstone || it.Value.Value is null)
+                    continue; // tombstony nie trafiają do SST
+
+                if (!isIndex)
                 {
                     var vOut = enc is null ? it.Value.Value : enc.Encrypt(it.Value.Value, name, it.Key);
-                    list.Add((it.Key, vOut));
+                    outList.Add((it.Key, vOut));
+                }
+                else
+                {
+                    // indeks – deduplikujemy po prefiksie wartości
+                    var prefix = IndexKeyCodec.ExtractValuePrefix(it.Key);
+                    var pSig = Convert.ToBase64String(prefix);
+                    var vOut = enc is null ? it.Value.Value : enc.Encrypt(it.Value.Value, name, it.Key);
+
+                    // RAM wygrywa – ostatni zapis w RAM dla danego prefiksu nadpisze wcześniejszy
+                    outByPrefix[pSig] = (it.Key, vOut);
                 }
             }
 
-            // 2b) Dociągnij klucze z poprzedniego SST, których nie nadpisała/nie skasowała oldMem
+            // 2b) Dociągnij ze starego SST to, czego RAM nie przykrył
             if (_sst.TryGetValue(name, out var prev))
             {
                 foreach (var (k, v) in prev.ScanRange(Array.Empty<byte>(), Array.Empty<byte>()))
                 {
-                    var sig = Convert.ToBase64String(k);
-                    if (!covered.Contains(sig))
+                    var exactSig = Convert.ToBase64String(k);
+                    if (coveredExact.Contains(exactSig))
+                        continue; // RAM (żywy albo tombstone) przykrywa dokładnie ten klucz
+
+                    if (!isIndex)
                     {
-                        // UWAGA: v już jest w formacie na-dysk (plaintext lub ciphertext).
-                        // Nie deszyfrujemy/nie re-encryptujemy – kopiujemy as-is.
-                        list.Add((k, v));
+                        // dla zwykłej tabeli kopiujemy as-is (na dysku już plaintext/ciphertext – bez re-encryptu)
+                        outList.Add((k, v));
+                    }
+                    else
+                    {
+                        // dla indeksu – dołóż TYLKO jeśli nie mamy już wpisu dla TEGO prefiksu
+                        var prefix = IndexKeyCodec.ExtractValuePrefix(k);
+                        var pSig = Convert.ToBase64String(prefix);
+
+                        if (!outByPrefix.ContainsKey(pSig))
+                            outByPrefix[pSig] = (k, v); // brak RAM-owego zwycięzcy – bierz pierwszy z SST
                     }
                 }
             }
 
-            // 2c) Posortuj po kluczu
+            // 2c) Posortuj po kluczu i zapisz nowy SST (atomowo)
+            IEnumerable<(byte[] Key, byte[] Val)> materialized =
+                isIndex ? outByPrefix.Values : outList;
+
+            var list = new List<(byte[] Key, byte[] Val)>(materialized);
             list.Sort(static (a, b) =>
             {
                 int min = Math.Min(a.Key.Length, b.Key.Length);
@@ -363,7 +400,6 @@ public sealed class WalnutDatabase : IDatabase
                 return a.Key.Length - b.Key.Length;
             });
 
-            // 2d) Zapisz nowy SST (atomowo)
             async IAsyncEnumerable<(byte[] Key, byte[] Val)> Source()
             {
                 foreach (var t in list) { yield return t; await Task.Yield(); }
@@ -394,9 +430,6 @@ public sealed class WalnutDatabase : IDatabase
         await Wal.FlushAsync(ct).ConfigureAwait(false);
         await Wal.TruncateAsync(ct).ConfigureAwait(false);
     }
-
-    // ---------- IDatabase ----------
-    // src/WalnutDb/Core/WalnutDatabase.cs  (TYLKO TREŚCI 3 METOD)
 
     public ValueTask<DbStats> GetStatsAsync(CancellationToken ct = default)
     {

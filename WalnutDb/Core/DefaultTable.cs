@@ -118,6 +118,7 @@ internal sealed class DefaultTable<T> : ITable<T>
 
         // 2) Unikalność – rezerwacje i checki.
         //    NOWE: jeżeli rezerwacja nie wyjdzie, krótko czekamy i próbujemy ponownie (kilka razy).
+        // —— UNIKALNOŚĆ: rezerwacja + checki —— //
         var reservedNow = new List<(string IndexTable, byte[] Prefix)>();
         try
         {
@@ -126,52 +127,44 @@ internal sealed class DefaultTable<T> : ITable<T>
                 if (!idx.Unique) continue;
 
                 var newValObj = idx.Extract(item);
-
-                if (newValObj is null) 
-                    continue; // NULL nie podlega unikalności
+                if (newValObj is null) continue; // NULL nie podlega unikalności
 
                 var newPrefix = IndexKeyCodec.Encode(newValObj, idx.DecimalScale);
                 var newIdxKey = IndexKeyCodec.ComposeIndexEntryKey(newPrefix, key);
                 var to = IndexKeyCodec.PrefixUpperBound(newPrefix);
 
-                // 2a) Rezerwacja globalna — retry krótki „wait until free”
-                const int maxAttempts = 12;          // ~ do kilkunastu tików
-                const int delayMicros = 200;         // lekki backoff (200 µs)
-                var attempt = 0;
-
-                // 2a) Rezerwacja globalna — retry z miękkim czekaniem do ~300 ms
+                // 1) Rezerwacja (jak masz) — z backoffem
                 var sw = System.Diagnostics.Stopwatch.StartNew();
                 var spin = new System.Threading.SpinWait();
-
                 while (!_db.TryReserveUnique(idx.IndexTableName, newPrefix, key))
                 {
-                    // Jeżeli rezerwacja jest zajęta przez „innego” właściciela,
-                    // poczekaj chwilę aż on zwolni (commit/apply) i spróbuj ponownie.
                     ct.ThrowIfCancellationRequested();
-
                     if (sw.Elapsed > TimeSpan.FromMilliseconds(300))
-                        throw new InvalidOperationException(
-                            $"Unique index '{idx.Name}' violation for value '{newValObj}'.");
-
-                    spin.SpinOnce();                // krótki aktywny spin
-                    if (spin.NextSpinWillYield)     // i gdy scheduler poprosi, oddaj kwant
-                        await Task.Delay(1, ct).ConfigureAwait(false);
+                        throw new InvalidOperationException($"Unique index '{idx.Name}' violation for value '{newValObj}'.");
+                    spin.SpinOnce();
+                    if (spin.NextSpinWillYield) await Task.Delay(1, ct).ConfigureAwait(false);
                 }
-
                 reservedNow.Add((idx.IndexTableName, newPrefix));
 
-                // jeśli transakcja zostanie porzucona, zwolnij rezerwację
+                // rollback safety
                 var capturedIdx = idx.IndexTableName;
                 var capturedPrefix = newPrefix;
                 tx.AddRollback(() => _db.ReleaseUnique(capturedIdx, capturedPrefix, key));
 
-                // 2b) Idempotencja — jeśli dokładnie (prefix|pk) już jest (MEM/SST) → OK.
+                // 2) (Opcjonalnie) sprawdź, czy mamy już dokładnie (prefix|pk)
+                bool haveExact = false;
                 foreach (var kv in idx.Mem.Current.SnapshotRange(newIdxKey, ExactUpperBound(newIdxKey), afterKeyExclusive: null))
-                { if (!kv.Value.Tombstone) goto AfterUniqueCheck; break; }
-                foreach (var _ in _db.ScanSstRange(idx.IndexTableName, newIdxKey, ExactUpperBound(newIdxKey)))
-                { goto AfterUniqueCheck; }
+                {
+                    if (!kv.Value.Tombstone) haveExact = true;
+                    break;
+                }
+                if (!haveExact)
+                {
+                    foreach (var _ in _db.ScanSstRange(idx.IndexTableName, newIdxKey, ExactUpperBound(newIdxKey)))
+                    { haveExact = true; break; }
+                }
 
-                // 2c) Ktoś inny z tym prefixem? (MEM – pomijaj tombstony)
+                // 3) ZAWSZE sprawdź, czy ktoś inny nie ma tego samego prefixu
                 foreach (var kv in idx.Mem.Current.SnapshotRange(newPrefix, to, afterKeyExclusive: null))
                 {
                     if (kv.Value.Tombstone) continue;
@@ -180,7 +173,6 @@ internal sealed class DefaultTable<T> : ITable<T>
                         throw new InvalidOperationException($"Unique index '{idx.Name}' violation for value '{newValObj}'.");
                 }
 
-                // 2d) Ktoś inny z tym prefixem w SST (uszanuj tombstony w MEM)
                 foreach (var kv in _db.ScanSstRange(idx.IndexTableName, newPrefix, to))
                 {
                     if (HasMemTombstone(idx.Mem.Current, kv.Key)) continue;
@@ -189,14 +181,13 @@ internal sealed class DefaultTable<T> : ITable<T>
                         throw new InvalidOperationException($"Unique index '{idx.Name}' violation for value '{newValObj}'.");
                 }
 
-            AfterUniqueCheck:;
+                // (koniec pętli indeksów)
             }
         }
         catch
         {
-            // Rolback rezerwacji z tej operacji
             foreach (var (idxTable, prefix) in reservedNow)
-                _db.ReleaseUnique(idxTable, prefix, key);
+                _db.ReleaseUnique(idxTable, prefix, key); // rollback rezerwacji tej operacji
             throw;
         }
 
@@ -244,6 +235,38 @@ internal sealed class DefaultTable<T> : ITable<T>
             // zawsze zapisz nowy wpis indeksu
             tx.AddPut(idx.IndexTableName, newIdxKey, Array.Empty<byte>());
             tx.AddApply(() => idx.Mem.Current.Upsert(newIdxKey, Array.Empty<byte>()));
+
+            // --- UNIQUE SWEEP: jako właściciel prefiksu usuń wszystkie inne (prefix|pk') ---
+            if (idx.Unique)
+            {
+                var to = IndexKeyCodec.PrefixUpperBound(newPrefix);
+
+                // z MEM
+                foreach (var kv in idx.Mem.Current.SnapshotRange(newPrefix, to, afterKeyExclusive: null))
+                {
+                    if (kv.Value.Tombstone) continue;
+                    var existingPk = IndexKeyCodec.ExtractPrimaryKey(kv.Key);
+                    if (!ByteArrayEquals(existingPk, key))
+                    {
+                        var dupKey = kv.Key;
+                        tx.AddDelete(idx.IndexTableName, dupKey);
+                        tx.AddApply(() => idx.Mem.Current.Delete(dupKey));
+                    }
+                }
+
+                // z SST (uszanuj tombstony w MEM)
+                foreach (var kv in _db.ScanSstRange(idx.IndexTableName, newPrefix, to))
+                {
+                    if (HasMemTombstone(idx.Mem.Current, kv.Key)) continue;
+                    var existingPk = IndexKeyCodec.ExtractPrimaryKey(kv.Key);
+                    if (!ByteArrayEquals(existingPk, key))
+                    {
+                        var dupKey = kv.Key;
+                        tx.AddDelete(idx.IndexTableName, dupKey);
+                        tx.AddApply(() => idx.Mem.Current.Delete(dupKey));
+                    }
+                }
+            }
         }
 
         // „Nowych” rezerwacji nie zwalniamy — rekord posiada tę wartość.
@@ -259,6 +282,7 @@ internal sealed class DefaultTable<T> : ITable<T>
 
         bool hasOld = false;
         T old = default!;
+        Diag.U($"DEL apply    table={_name} key={Diag.B64(key)}");
 
         if (_memRef.Current.TryGet(key, out var rawOld) && rawOld is not null)
         {
@@ -319,6 +343,9 @@ internal sealed class DefaultTable<T> : ITable<T>
 
         bool hasOld = true; // użyjemy wartości z item jeśli nie ma w MEM
         T old = item;
+
+        Diag.U($"DEL apply    table={_name} key={Diag.B64(key)}");
+
         if (_memRef.Current.TryGet(key, out var rawOld) && rawOld is not null)
             old = _map.Deserialize(rawOld);
 
@@ -373,7 +400,8 @@ internal sealed class DefaultTable<T> : ITable<T>
         if (_db.TryGetFromSst(_name, key, out var fromSst) && fromSst is not null)
         {
             var enc = _db.Encryption;
-            var payload = (enc is null) ? fromSst : enc.Decrypt(fromSst, _name, key);
+            var payload = (enc is null) ? fromSst : enc.Decrypt(fromSst, _name, key); 
+            //Diag.U($"GET sst-hit  table={_name} key={Diag.B64(key)} tomb={HasMemTombstone(_memRef.Current, key)}");
             return ValueTask.FromResult<T?>(_map.Deserialize(payload));
         }
         return ValueTask.FromResult<T?>(default);
@@ -479,10 +507,10 @@ internal sealed class DefaultTable<T> : ITable<T>
     }
 
     public async IAsyncEnumerable<T> ScanByIndexAsync(
-        IndexHint hint,
-        int pageSize = 1024,
-        ReadOnlyMemory<byte> token = default,
-        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+    IndexHint hint,
+    int pageSize = 1024,
+    ReadOnlyMemory<byte> token = default,
+    [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
         var idx = _indexes.Find(i => string.Equals(i.Name, hint.IndexName, StringComparison.Ordinal));
         if (idx is null)
@@ -503,6 +531,9 @@ internal sealed class DefaultTable<T> : ITable<T>
 
         if (hint.Asc)
         {
+            // SEEN-PFX: deduplikacja po prefiksie wartości (np. Email)
+            var seenPrefixes = new HashSet<string>(StringComparer.Ordinal);
+
             int skipped = 0;
             int yielded = 0;
             int? limit = hint.Take;
@@ -517,19 +548,28 @@ internal sealed class DefaultTable<T> : ITable<T>
                     var rec = memEnum.Current; hasMem = memEnum.MoveNext();
                     if (!rec.Value.Tombstone)
                     {
-                        var pk = IndexKeyCodec.ExtractPrimaryKey(rec.Key);
+                        // SnapshotRange już respektuje 'after', ale zachowujemy check
                         if (after is null || ByteCompare(rec.Key, after) > 0)
                         {
-                            var obj = await GetAsync((object)pk, ct).ConfigureAwait(false);
-                            if (obj is not null)
+                            // SEEN-PFX (MEM)
+                            var pfx = IndexKeyCodec.ExtractValuePrefix(rec.Key);
+                            var pSig = Convert.ToBase64String(pfx);
+                            if (!seenPrefixes.Contains(pSig))
                             {
-                                if (hint.Skip > 0 && skipped < hint.Skip) { skipped++; }
-                                else
+                                seenPrefixes.Add(pSig);
+
+                                var pk = IndexKeyCodec.ExtractPrimaryKey(rec.Key);
+                                var obj = await GetAsync((object)pk, ct).ConfigureAwait(false);
+                                if (obj is not null)
                                 {
-                                    yield return obj;
-                                    yielded++;
-                                    if (++sent >= pageSize) { sent = 0; await Task.Yield(); }
-                                    if (limit is int l && yielded >= l) yield break;
+                                    if (hint.Skip > 0 && skipped < hint.Skip) { skipped++; }
+                                    else
+                                    {
+                                        yield return obj;
+                                        yielded++;
+                                        if (++sent >= pageSize) { sent = 0; await Task.Yield(); }
+                                        if (limit is int l && yielded >= l) yield break;
+                                    }
                                 }
                             }
                         }
@@ -541,22 +581,32 @@ internal sealed class DefaultTable<T> : ITable<T>
                 else
                 {
                     var rec = sstEnum.Current; hasSst = sstEnum.MoveNext();
+
+                    // Nie pokazuj wpisów przykrytych przez tombstone w MEM
                     if (HasMemTombstone(idx.Mem.Current, rec.Key)) continue;
 
+                    if (after is not null && ByteCompare(rec.Key, after) <= 0)
+                        continue;
+
+                    // SEEN-PFX (SST)
+                    var pfx = IndexKeyCodec.ExtractValuePrefix(rec.Key);
+                    var pSig = Convert.ToBase64String(pfx);
+                    if (seenPrefixes.Contains(pSig))
+                        continue;
+
+                    seenPrefixes.Add(pSig);
+
                     var pk = IndexKeyCodec.ExtractPrimaryKey(rec.Key);
-                    if (after is null || ByteCompare(rec.Key, after) > 0)
+                    var obj = await GetAsync((object)pk, ct).ConfigureAwait(false);
+                    if (obj is not null)
                     {
-                        var obj = await GetAsync((object)pk, ct).ConfigureAwait(false);
-                        if (obj is not null)
+                        if (hint.Skip > 0 && skipped < hint.Skip) { skipped++; }
+                        else
                         {
-                            if (hint.Skip > 0 && skipped < hint.Skip) { skipped++; }
-                            else
-                            {
-                                yield return obj;
-                                yielded++;
-                                if (++sent >= pageSize) { sent = 0; await Task.Yield(); }
-                                if (limit is int l && yielded >= l) yield break;
-                            }
+                            yield return obj;
+                            yielded++;
+                            if (++sent >= pageSize) { sent = 0; await Task.Yield(); }
+                            if (limit is int l && yielded >= l) yield break;
                         }
                     }
                 }
@@ -567,6 +617,8 @@ internal sealed class DefaultTable<T> : ITable<T>
         // DESC – bufor końcówki
         var cap = hint.Take is int t ? (hint.Skip + t) : int.MaxValue;
         var ring = new LinkedList<T>();
+        // SEEN-PFX dla trybu DESC
+        var seenPrefixesDesc = new HashSet<string>(StringComparer.Ordinal);
 
         while (hasMem || hasSst)
         {
@@ -578,14 +630,22 @@ internal sealed class DefaultTable<T> : ITable<T>
                 var rec = memEnum.Current; hasMem = memEnum.MoveNext();
                 if (!rec.Value.Tombstone)
                 {
-                    var pk = IndexKeyCodec.ExtractPrimaryKey(rec.Key);
                     if (after is null || ByteCompare(rec.Key, after) > 0)
                     {
-                        var obj = await GetAsync((object)pk, ct).ConfigureAwait(false);
-                        if (obj is not null)
+                        // SEEN-PFX (MEM, DESC)
+                        var pfx = IndexKeyCodec.ExtractValuePrefix(rec.Key);
+                        var pSig = Convert.ToBase64String(pfx);
+                        if (!seenPrefixesDesc.Contains(pSig))
                         {
-                            ring.AddLast(obj);
-                            if (ring.Count > cap) ring.RemoveFirst();
+                            seenPrefixesDesc.Add(pSig);
+
+                            var pk = IndexKeyCodec.ExtractPrimaryKey(rec.Key);
+                            var obj = await GetAsync((object)pk, ct).ConfigureAwait(false);
+                            if (obj is not null)
+                            {
+                                ring.AddLast(obj);
+                                if (ring.Count > cap) ring.RemoveFirst();
+                            }
                         }
                     }
                     lastKey = rec.Key;
@@ -598,15 +658,23 @@ internal sealed class DefaultTable<T> : ITable<T>
                 var rec = sstEnum.Current; hasSst = sstEnum.MoveNext();
                 if (HasMemTombstone(idx.Mem.Current, rec.Key)) continue;
 
+                if (after is not null && ByteCompare(rec.Key, after) <= 0)
+                    continue;
+
+                // SEEN-PFX (SST, DESC)
+                var pfx = IndexKeyCodec.ExtractValuePrefix(rec.Key);
+                var pSig = Convert.ToBase64String(pfx);
+                if (seenPrefixesDesc.Contains(pSig))
+                    continue;
+
+                seenPrefixesDesc.Add(pSig);
+
                 var pk = IndexKeyCodec.ExtractPrimaryKey(rec.Key);
-                if (after is null || ByteCompare(rec.Key, after) > 0)
+                var obj = await GetAsync((object)pk, ct).ConfigureAwait(false);
+                if (obj is not null)
                 {
-                    var obj = await GetAsync((object)pk, ct).ConfigureAwait(false);
-                    if (obj is not null)
-                    {
-                        ring.AddLast(obj);
-                        if (ring.Count > cap) ring.RemoveFirst();
-                    }
+                    ring.AddLast(obj);
+                    if (ring.Count > cap) ring.RemoveFirst();
                 }
             }
         }
@@ -693,12 +761,8 @@ internal sealed class DefaultTable<T> : ITable<T>
         return to;
     }
 
-    private static bool HasMemTombstone(MemTable mem, byte[] compositeKey)
-    {
-        foreach (var kv in mem.SnapshotRange(compositeKey, ExactUpperBound(compositeKey), afterKeyExclusive: null))
-            return kv.Value.Tombstone;
-        return false;
-    }
+    private static bool HasMemTombstone(MemTable mem, byte[] key)
+    => mem.HasTombstoneExact(key);
 
     private static bool ByteArrayEquals(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b)
     {

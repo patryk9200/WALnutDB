@@ -93,6 +93,16 @@ internal sealed class MemTable
         }
     }
 
+    public bool HasTombstoneExact(byte[] key)
+    {
+        _rw.EnterReadLock();
+        try
+        {
+            return _map.TryGetValue(key, out var e) && e.Tombstone;
+        }
+        finally { _rw.ExitReadLock(); }
+    }
+
     private static int ByteCompare(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b)
     {
         int n = Math.Min(a.Length, b.Length);

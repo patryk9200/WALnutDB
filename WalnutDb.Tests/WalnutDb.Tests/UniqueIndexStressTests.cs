@@ -53,22 +53,25 @@ public sealed class UniqueIndexStressTests
                     {
                         if (action < 0.10) // 10% delete
                         {
-                            await tbl.DeleteAsync(id); // ⟵ bez tokena – op kończy się w całości
+                            var res = await tbl.DeleteAsync(id); // ⟵ bez tokena – op kończy się w całości
+                            Console.WriteLine($"Deleted user {id}: {res}");
                         }
                         else // 90% upsert
                         {
                             var email = emails[rnd.Next(emails.Length)];
-                            await tbl.UpsertAsync(new UxStressUser { Id = id, Email = email }); // ⟵ bez tokena
+                            var res = await tbl.UpsertAsync(new UxStressUser { Id = id, Email = email }); // ⟵ bez tokena
+                            Console.WriteLine($"Upserted user {id} with email {email}: {res}");
                         }
                     }
-                    catch (InvalidOperationException)
+                    catch (InvalidOperationException ex)
                     {
+                        Console.WriteLine($"Error for user {id}, kolizja unikalności: {ex.Message}");
                         // spodziewane kolizje unikalności – ignorujemy
                     }
                     await Task.Yield();
                 }
             }
-            catch (OperationCanceledException) { /* swallow */ }
+            catch (OperationCanceledException ex) { Console.WriteLine(ex); }
         }).ToArray();
 
         var chkTask = Task.Run(async () =>
@@ -76,10 +79,17 @@ public sealed class UniqueIndexStressTests
             while (true)
             {
                 try { await Task.Delay(200, cts.Token); }
-                catch (OperationCanceledException) { break; }
+                catch (OperationCanceledException ex)
+                {
+                    Console.WriteLine(ex);
+                    break;
+                }
 
                 try { await db.CheckpointAsync(); } // ⟵ bez tokena
-                catch { /* miękkie błędy ignorujemy */ }
+                catch (Exception ex)
+                {
+                    Console.WriteLine(ex);
+                }
             }
         }, cts.Token);
 
@@ -90,9 +100,22 @@ public sealed class UniqueIndexStressTests
         var dupCheck = new Dictionary<string, int>(StringComparer.Ordinal);
         await foreach (var u in tbl.ScanByIndexAsync("Email", default, default))
         {
-            if (u.Email is null) continue;
+            if (u.Email is null)
+            {
+                Console.WriteLine($"User {u.Id} has null email, skipping.");
+                continue;
+            }
+            if (dupCheck.ContainsKey(u.Email) && dupCheck[u.Email] > 0)
+            {
+                Console.WriteLine($"Duplicate email found: {u.Email} for user {u.Id}");
+            }
             dupCheck.TryGetValue(u.Email, out var c);
             dupCheck[u.Email] = c + 1;
+        }
+
+        foreach (var kv in dupCheck)
+        {
+            Console.WriteLine($"Email: {kv.Key}, Count: {kv.Value}");
         }
 
         foreach (var kv in dupCheck)

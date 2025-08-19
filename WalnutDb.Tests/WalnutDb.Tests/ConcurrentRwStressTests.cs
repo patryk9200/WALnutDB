@@ -38,13 +38,13 @@ public sealed class ConcurrentRwStressTests
         await db.CheckpointAsync();             // przenieś do SST
         await tbl.DeleteAsync("k1");            // tombstone w MEM, SST ma jeszcze starą wartość
 
-        Assert.Null(await tbl.GetAsync("k1"));  // bez tej łatki mógł wracać obiekt
+        var tmp = await tbl.GetAsync("k1");
+        Assert.Null(tmp.Id);  // bez tej łatki mógł wracać obiekt
         int seen = 0;
         await foreach (var _ in tbl.GetAllAsync()) seen++;
         // nie powinien pokazać "k1" w skanie
         Assert.Equal(0, seen);
     }
-
 
     [Fact]
     public async Task Concurrent_Writes_Reads_With_Checkpoints_Match_Final_State()
