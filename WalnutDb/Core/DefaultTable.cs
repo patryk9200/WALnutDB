@@ -68,17 +68,43 @@ internal sealed class DefaultTable<T> : ITable<T>
     public async ValueTask<bool> DeleteAsync(object id, CancellationToken ct = default)
     {
         await using var tx = await _db.BeginTransactionAsync(ct).ConfigureAwait(false);
-        var ok = await DeleteAsync(id, tx, ct).ConfigureAwait(false);
+
+        // Zbuduj operacje, ale nie ufaj "ok" z wersji transakcyjnej – interesuje nas post-commit.
+        _ = await DeleteAsync(id, tx, ct).ConfigureAwait(false);
         await tx.CommitAsync(Durability.Safe, ct).ConfigureAwait(false);
-        return ok;
+
+        // === POST-COMMIT: sprawdź faktyczną widoczność klucza ===
+        var key = _map.EncodeIdToBytes(id);
+
+        // Jeśli w MEM leży tombstone – delete skuteczny (nawet jeśli "stary" nie był widoczny na starcie).
+        if (HasMemTombstone(_memRef.Current, key))
+            return true;
+
+        // Jeśli MEM ma żywą wartość – delete nie wyciął (ktoś mógł nadpisać po naszym commicie).
+        if (_memRef.Current.TryGet(key, out var _))
+            return false;
+
+        // Brak w MEM i brak tombstone → sprawdź SST (widoczne tylko gdy MEM go nie chowa).
+        if (_db.TryGetFromSst(_name, key, out var fromSst) && fromSst is not null)
+            return false;
+
+        // Nie ma ani w MEM, ani w SST → traktuj jako skuteczne usunięcie.
+        return true;
     }
 
     public async ValueTask<bool> DeleteAsync(T item, CancellationToken ct = default)
     {
         await using var tx = await _db.BeginTransactionAsync(ct).ConfigureAwait(false);
-        var ok = await DeleteAsync(item, tx, ct).ConfigureAwait(false);
+
+        _ = await DeleteAsync(item, tx, ct).ConfigureAwait(false);
         await tx.CommitAsync(Durability.Safe, ct).ConfigureAwait(false);
-        return ok;
+
+        var key = _map.GetKeyBytes(item);
+
+        if (HasMemTombstone(_memRef.Current, key)) return true;
+        if (_memRef.Current.TryGet(key, out var _)) return false;
+        if (_db.TryGetFromSst(_name, key, out var fromSst) && fromSst is not null) return false;
+        return true;
     }
 
     public ValueTask<bool> DeleteAsync(Guid id, CancellationToken ct = default)
@@ -282,9 +308,10 @@ internal sealed class DefaultTable<T> : ITable<T>
 
         var key = _map.EncodeIdToBytes(id);
 
-        // Spróbuj odczytać "old" (MEM -> SST)
         bool hasOld = false;
         T old = default!;
+        Diag.U($"DEL apply    table={_name} key={Diag.B64(key)}");
+
         if (_memRef.Current.TryGet(key, out var rawOld) && rawOld is not null)
         {
             old = _map.Deserialize(rawOld);
@@ -298,11 +325,13 @@ internal sealed class DefaultTable<T> : ITable<T>
             hasOld = true;
         }
 
-        // Zawsze: tombstone w tabeli (delete w LSM)
         tx.AddDelete(_name, key);
-        tx.AddApply(() => _memRef.Current.Delete(key));
+        tx.AddApply(() =>
+        {
+            _memRef.Current.Delete(key);
+            Diag.U($"TABLE del    table={_name} pk={Diag.B64(key)}");
+        });
 
-        // Jeśli było "old": usuń wpisy indeksów i zwolnij unikalność
         if (hasOld)
         {
             foreach (var idx in _indexes)
@@ -314,18 +343,25 @@ internal sealed class DefaultTable<T> : ITable<T>
                 var oldIdxKey = IndexKeyCodec.ComposeIndexEntryKey(oldPrefix, key);
 
                 tx.AddDelete(idx.IndexTableName, oldIdxKey);
-                tx.AddApply(() => idx.Mem.Current.Delete(oldIdxKey));
+                tx.AddApply(() =>
+                {
+                    idx.Mem.Current.Delete(oldIdxKey);
+                    Diag.U($"IDX del      idx={idx.IndexTableName} old={Diag.B64(oldPrefix)} pk={Diag.B64(key)}");
+                });
 
                 var capturedIdx = idx.IndexTableName;
                 var capturedOld = oldPrefix;
-                tx.AddApply(() => _db.ReleaseUnique(capturedIdx, capturedOld, key));
+                tx.AddApply(() =>
+                {
+                    _db.ReleaseUnique(capturedIdx, capturedOld, key);
+                    Diag.U($"UNIQ free    idx={capturedIdx} old={Diag.B64(capturedOld)} pk={Diag.B64(key)}");
+                });
             }
         }
 
-        // Stabilna semantyka dla testu RW: delete zawsze "udane".
-        return true;
+        // ⬇⬇⬇ to jest klucz do stabilności testu RW
+        return hasOld;
     }
-
 
     public ValueTask<bool> DeleteAsync(T item, ITransaction txHandle, CancellationToken ct = default)
     {
@@ -336,8 +372,8 @@ internal sealed class DefaultTable<T> : ITable<T>
 
         bool hasOld = false;
         T old = default!;
+        Diag.U($"DEL apply    table={_name} key={Diag.B64(key)}");
 
-        // sprawdź MEM/SST (nie zakładaj z góry true)
         if (_memRef.Current.TryGet(key, out var rawOld) && rawOld is not null)
         {
             old = _map.Deserialize(rawOld);
@@ -346,19 +382,46 @@ internal sealed class DefaultTable<T> : ITable<T>
         else if (_db.TryGetFromSst(_name, key, out var sstVal) && sstVal is not null)
         {
             var enc = _db.Encryption;
-            var payload = enc is null ? sstVal : enc.Decrypt(sstVal, _name, key);
+            var payload = (enc is null) ? sstVal : enc.Decrypt(sstVal, _name, key);
             old = _map.Deserialize(payload);
             hasOld = true;
         }
 
         tx.AddDelete(_name, key);
-        tx.AddApply(() => _memRef.Current.Delete(key));
+        tx.AddApply(() =>
+        {
+            _memRef.Current.Delete(key);
+            Diag.U($"TABLE del    table={_name} pk={Diag.B64(key)}");
+        });
 
         if (hasOld)
         {
-            // ... kasowanie wpisów indeksów + release guardów
+            foreach (var idx in _indexes)
+            {
+                var oldValObj = idx.Extract(old);
+                if (oldValObj is null) continue;
+
+                var oldPrefix = IndexKeyCodec.Encode(oldValObj, idx.DecimalScale);
+                var oldIdxKey = IndexKeyCodec.ComposeIndexEntryKey(oldPrefix, key);
+
+                tx.AddDelete(idx.IndexTableName, oldIdxKey);
+                tx.AddApply(() =>
+                {
+                    idx.Mem.Current.Delete(oldIdxKey);
+                    Diag.U($"IDX del      idx={idx.IndexTableName} old={Diag.B64(oldPrefix)} pk={Diag.B64(key)}");
+                });
+
+                var capturedIdx = idx.IndexTableName;
+                var capturedOld = oldPrefix;
+                tx.AddApply(() =>
+                {
+                    _db.ReleaseUnique(capturedIdx, capturedOld, key);
+                    Diag.U($"UNIQ free    idx={capturedIdx} old={Diag.B64(capturedOld)} pk={Diag.B64(key)}");
+                });
+            }
         }
 
+        // ⬇⬇⬇ również tu: zwróć prawdę o tym, czy było co usuwać
         return ValueTask.FromResult(hasOld);
     }
 
@@ -376,7 +439,7 @@ internal sealed class DefaultTable<T> : ITable<T>
         if (_db.TryGetFromSst(_name, key, out var fromSst) && fromSst is not null)
         {
             var enc = _db.Encryption;
-            var payload = (enc is null) ? fromSst : enc.Decrypt(fromSst, _name, key); 
+            var payload = (enc is null) ? fromSst : enc.Decrypt(fromSst, _name, key);
             //Diag.U($"GET sst-hit  table={_name} key={Diag.B64(key)} tomb={HasMemTombstone(_memRef.Current, key)}");
             return ValueTask.FromResult<T?>(_map.Deserialize(payload));
         }

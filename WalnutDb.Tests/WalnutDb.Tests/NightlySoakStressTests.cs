@@ -1,9 +1,17 @@
 ﻿#nullable enable
+using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
 
 using WalnutDb;
 using WalnutDb.Core;
 using WalnutDb.Wal;
+
+using Xunit;
 
 public sealed class NightlySoakStressTests
 {
@@ -43,7 +51,7 @@ public sealed class NightlySoakStressTests
         var duration = GetDurationSeconds(@default: 15);
         var keys = Enumerable.Range(0, keyCount).Select(i => $"k{i:D4}").ToArray();
 
-        // „Model” stanu końcowego
+        // „Model” – uaktualniany zawsze po R/W na podstawie faktycznego widoku DB
         var expected = new ConcurrentDictionary<string, int?>();
 
         using var cts = new CancellationTokenSource(duration);
@@ -57,17 +65,21 @@ public sealed class NightlySoakStressTests
                 while (!cts.IsCancellationRequested)
                 {
                     var k = keys[rnd.Next(keys.Length)];
-                    if (rnd.NextDouble() < 0.80) // 80% upsert
+
+                    if (rnd.NextDouble() < 0.80)
                     {
                         int v = Interlocked.Increment(ref opId);
-                        var ok = await tbl.UpsertAsync(new Doc { Id = k, Value = v });
-                        if (ok) expected[k] = v;
+                        await tbl.UpsertAsync(new Doc { Id = k, Value = v });  // commit zakończony
                     }
-                    else // 20% delete
+                    else
                     {
-                        var ok = await tbl.DeleteAsync(k); // u nas delete zawsze „udany” → tombstone
-                        if (ok) expected[k] = null;
+                        await tbl.DeleteAsync(k);                               // commit zakończony
                     }
+
+                    // READ-AFTER-WRITE ⇒ model = to, co naprawdę teraz widać
+                    var cur = await tbl.GetAsync(k);
+                    expected[k] = cur is null ? (int?)null : cur.Value;
+
                     await Task.Yield();
                 }
             }
@@ -85,8 +97,7 @@ public sealed class NightlySoakStressTests
                     {
                         if (rnd.Next(2) == 0)
                         {
-                            await foreach (var _ in tbl.GetAllAsync(pageSize: 256, ct: cts.Token))
-                            { /* side-effect free – liczniki są kruche, więc ich nie trzymamy */ }
+                            await foreach (var _ in tbl.GetAllAsync(pageSize: 256, ct: cts.Token)) { }
                         }
                         else
                         {
@@ -99,7 +110,7 @@ public sealed class NightlySoakStressTests
                     await Task.Yield();
                 }
             }
-            catch (OperationCanceledException) { /* koniec czasu */ }
+            catch (OperationCanceledException) { }
         }).ToArray();
 
         var chkTask = Task.Run(async () =>
@@ -113,14 +124,14 @@ public sealed class NightlySoakStressTests
 
         await Task.WhenAll(writerTasks.Concat(readerTasks).Append(chkTask));
 
-        // Stan końcowy – deterministyczna weryfikacja
+        // „Ustal” ostatni stan w SST (żeby nie wisiało w MEM z tombstonami)
         await db.CheckpointAsync();
 
-        // A) porównaj zbiory kluczy istniejących
-        var expectedAlive = expected.Where(kv => kv.Value.HasValue).Select(kv => kv.Key).ToHashSet();
+        // A) zbiory kluczy żyjących
+        var expectedAlive = expected.Where(kv => kv.Value.HasValue).Select(kv => kv.Key).ToHashSet(StringComparer.Ordinal);
 
         var actualAlive = new HashSet<string>(StringComparer.Ordinal);
-        await foreach (var d in tbl.GetAllAsync(pageSize: 1024))
+        await foreach (var d in tbl.GetAllAsync(pageSize: 2048))
             actualAlive.Add(d.Id);
 
         if (!expectedAlive.SetEquals(actualAlive))
@@ -134,7 +145,7 @@ public sealed class NightlySoakStressTests
             Assert.True(false, msg);
         }
 
-        // B) porównaj wartości dla żyjących kluczy (sanity check)
+        // B) sanity: wartości dla żyjących
         foreach (var k in expectedAlive)
         {
             var got = await tbl.GetAsync(k);
