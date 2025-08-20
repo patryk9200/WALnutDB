@@ -34,6 +34,12 @@ Roadmap: online compaction/defrag stats &amp; swap, unique index enforcement, op
     <Copyright>Patryk Golus</Copyright>
     <PackageIcon>logo.jpg</PackageIcon>
     <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <IncludeSymbols>True</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <RepositoryUrl>https://github.com/patryk9200/WALnutDB</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageProjectUrl>https://github.com/patryk9200/WALnutDB</PackageProjectUrl>
   </PropertyGroup>
   <ItemGroup>
     <InternalsVisibleTo Include="WalnutDb.Tests" />
