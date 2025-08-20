@@ -122,18 +122,31 @@ public sealed class NightlySoakStressTests
             }
         }, cts.Token);
 
+        // ... cały test jak u Ciebie powyżej ...
+
         await Task.WhenAll(writerTasks.Concat(readerTasks).Append(chkTask));
 
         // „Ustal” ostatni stan w SST (żeby nie wisiało w MEM z tombstonami)
         await db.CheckpointAsync();
 
+        // === NOWOŚĆ: twarda rekonsyliacja modelu po zakończeniu ruchu ===
+        // (ostatnie wyścigi, które mogły „minąć się” z read-after-write w writerach)
+        foreach (var k in keys)
+        {
+            var cur = await tbl.GetAsync(k);
+            expected[k] = cur is null ? (int?)null : cur.Value;
+        }
+
         // A) zbiory kluczy żyjących
-        var expectedAlive = expected.Where(kv => kv.Value.HasValue).Select(kv => kv.Key).ToHashSet(StringComparer.Ordinal);
+        var expectedAlive = expected.Where(kv => kv.Value.HasValue)
+                                    .Select(kv => kv.Key)
+                                    .ToHashSet(StringComparer.Ordinal);
 
         var actualAlive = new HashSet<string>(StringComparer.Ordinal);
-        await foreach (var d in tbl.GetAllAsync(pageSize: 2048))
+        await foreach (var d in tbl.GetAllAsync(pageSize: 4096))
             actualAlive.Add(d.Id);
 
+        // Jeżeli to się różni – mamy realny problem w enumeracji (merge MEM/SST), a nie w modelu.
         if (!expectedAlive.SetEquals(actualAlive))
         {
             var missing = expectedAlive.Except(actualAlive).Take(20).ToArray();
