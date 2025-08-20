@@ -9,6 +9,7 @@ internal sealed class WalnutTransaction : WalnutDb.ITransaction
     private readonly WalnutDatabase _db;
     private readonly ulong _txId;
     private readonly ulong _seqNo;
+
     private int _ops;
 
     // Zbieramy ramki WAL w pamięci (BEGIN/PUT/DELETE/…/COMMIT)

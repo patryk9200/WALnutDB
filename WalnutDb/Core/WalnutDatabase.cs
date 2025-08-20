@@ -16,7 +16,7 @@ public sealed class WalnutDatabase : IDatabase
     private readonly IManifestStore _manifest;
     internal readonly IWalWriter Wal;
     private readonly string _sstDir;
-    private ulong _nextSeqNo = 1;
+    private long _nextSeqNo = 1;
     private readonly ITypeNameResolver _typeNames;
     internal IEncryption? Encryption => _options.Encryption;
     private readonly ConcurrentDictionary<string, SstReader> _sst = new();
@@ -696,9 +696,8 @@ public sealed class WalnutDatabase : IDatabase
 
     public async ValueTask<ITransaction> BeginTransactionAsync(CancellationToken ct = default)
     {
-        // Przydziel unikalne txId i seqNo
         var txId = (ulong)(Random.Shared.NextInt64() & long.MaxValue);
-        var seq = _nextSeqNo++;
+        var seq = (ulong)Interlocked.Increment(ref _nextSeqNo);
         await Task.Yield();
         return new WalnutTransaction(this, txId, seq);
     }

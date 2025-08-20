@@ -1,8 +1,4 @@
 ﻿#nullable enable
-using System;
-using System.Linq;
-using System.Threading;
-using System.Threading.Tasks;
 using System.Collections.Concurrent;
 
 using WalnutDb.Core;
@@ -80,14 +76,16 @@ public sealed class ConcurrentRwStressTests
                         {
                             int v = Interlocked.Increment(ref opId);
                             var doc = new StressDoc { Id = k, Value = v };
-                            var ok = await tbl.UpsertAsync(doc); // ⟵ bez tokena
-                            if (ok) expected[k] = v;
+                            await tbl.UpsertAsync(doc); // nie ufamy boolowi – commit + potem read
                         }
                         else // 25% delete
                         {
-                            var ok = await tbl.DeleteAsync(k);  // ⟵ bez tokena
-                            if (ok) expected[k] = null;
+                            await tbl.DeleteAsync(k);  // j.w.
                         }
+
+                        // READ-AFTER-WRITE: model to faktyczny stan bazy po operacji
+                        var cur = await tbl.GetAsync(k);
+                        expected[k] = cur is null ? (int?)null : cur.Value;
                     }
                     catch (OperationCanceledException)
                     {
@@ -139,27 +137,40 @@ public sealed class ConcurrentRwStressTests
                 try { await Task.Delay(200, cts.Token); }
                 catch (OperationCanceledException) { break; }
 
-                try { await db.CheckpointAsync(); } // ⟵ bez tokena
+                try { await db.CheckpointAsync(); } // best-effort
                 catch { }
             }
         }, cts.Token);
 
         await Task.WhenAll(writerTasks.Concat(readerTasks).Append(chkTask));
 
+        // Ostatni checkpoint – przenieś ogon do SST
         await db.CheckpointAsync();
 
-        foreach (var kv in expected)
+        // REKONSYLACJA: tuż po zakończeniu wszystkich zadań i checkpoint'cie
+        // pobierz realny stan dla KAŻDEGO klucza (zamyka „ostatnie milisekundy” wyścigów).
+        foreach (var k in keys)
         {
-            var got = await tbl.GetAsync(kv.Key);
-            if (kv.Value is null)
+            var cur = await tbl.GetAsync(k);
+            expected[k] = cur is null ? (int?)null : cur.Value;
+        }
+
+        // Weryfikacja: każdy klucz ma w DB to samo, co w modelu
+        foreach (var k in keys)
+        {
+            var got = await tbl.GetAsync(k);
+            var want = expected[k];
+
+            if (want is null)
             {
                 Assert.Null(got);
             }
             else
             {
                 Assert.NotNull(got);
-                Assert.Equal(kv.Value.Value, got!.Value);
+                Assert.Equal(want.Value, got!.Value);
             }
         }
     }
+
 }

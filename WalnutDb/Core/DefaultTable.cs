@@ -760,7 +760,35 @@ internal sealed class DefaultTable<T> : ITable<T>
         }
     }
 
-    // ---------------- Helpers ----------------
+    public readonly record struct CommitResult(bool Ok, ulong Seq);
+
+    public async ValueTask<CommitResult> UpsertWithSeqAsync(T item, CancellationToken ct = default)
+    {
+        await using var tx = await _db.BeginTransactionAsync(ct).ConfigureAwait(false);
+        var ok = await UpsertAsync(item, tx, ct).ConfigureAwait(false);
+        var seq = ((WalnutTransaction)tx).SeqNo;
+        await tx.CommitAsync(Durability.Safe, ct).ConfigureAwait(false);
+        return new CommitResult(ok, seq);
+    }
+
+    public async ValueTask<CommitResult> DeleteWithSeqAsync(object id, CancellationToken ct = default)
+    {
+        await using var tx = await _db.BeginTransactionAsync(ct).ConfigureAwait(false);
+        var ok = await DeleteAsync(id, tx, ct).ConfigureAwait(false);
+        var seq = ((WalnutTransaction)tx).SeqNo;
+        await tx.CommitAsync(Durability.Safe, ct).ConfigureAwait(false);
+        return new CommitResult(ok, seq);
+    }
+
+    public async ValueTask<CommitResult> DeleteWithSeqAsync(T item, CancellationToken ct = default)
+    {
+        await using var tx = await _db.BeginTransactionAsync(ct).ConfigureAwait(false);
+        var ok = await DeleteAsync(item, tx, ct).ConfigureAwait(false);
+        var seq = ((WalnutTransaction)tx).SeqNo;
+        await tx.CommitAsync(Durability.Safe, ct).ConfigureAwait(false);
+        return new CommitResult(ok, seq);
+    }
+
     private static byte[] ExactUpperBound(byte[] key)
     {
         var to = new byte[key.Length + 1];
