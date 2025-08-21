@@ -665,11 +665,86 @@ public sealed class WalnutDatabase : IDatabase
     public ValueTask<ITable<T>> OpenTableAsync<T>(TableOptions<T> options, CancellationToken ct = default)
         => OpenTableAsync<T>(_typeNames.Resolve(typeof(T)), options, ct);
 
-    public ValueTask DeleteTableAsync(string name, CancellationToken ct = default)
+    public async ValueTask DropTableAsync(string name, CancellationToken ct = default)
     {
-        _tables.TryRemove(name, out _);
-        return ValueTask.CompletedTask;
+        // single-writer na czas modyfikacji struktur
+        await WriterLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            // 1) zabij memkę tabeli
+            _tables.TryRemove(name, out _);
+
+            // 2) zamknij i usuń SST
+            if (_sst.TryRemove(name, out var sst))
+            {
+                try { sst.Dispose(); } catch { /* ignore */ }
+            }
+
+            var safe = EncodeNameToFile(name);
+            var sstPath = Path.Combine(_sstDir, $"{safe}.sst");
+            var tmpPath = Path.Combine(_sstDir, $"{safe}.sst.tmp");
+            TryDeleteFile(sstPath);
+            TryDeleteFile(tmpPath);
+
+            // 3) usuń wszystkie indeksy tej tabeli
+            var idxPrefix = $"__index__{name}__"; // taki mamy schemat nazewnictwa
+            var indexNames = _tables.Keys
+                .Concat(_sst.Keys)
+                .Where(n => n.StartsWith(idxPrefix, StringComparison.Ordinal))
+                .Distinct()
+                .ToArray();
+
+            foreach (var idxName in indexNames)
+            {
+                // mem
+                _tables.TryRemove(idxName, out _);
+
+                // sst
+                if (_sst.TryRemove(idxName, out var idxSst))
+                    try { idxSst.Dispose(); } catch { }
+
+                var idxSafe = EncodeNameToFile(idxName);
+                TryDeleteFile(Path.Combine(_sstDir, $"{idxSafe}.sst"));
+                TryDeleteFile(Path.Combine(_sstDir, $"{idxSafe}.sst.tmp"));
+
+                // guardy unikalności
+                RemoveUniqueGuardsForIndex(idxName);
+                _indexUnique.TryRemove(idxName, out _);
+            }
+
+            // 4) (opcjonalnie) flush WAL; w naszym modelu to wystarczy
+        }
+        finally
+        {
+            WriterLock.Release();
+        }
+
+        await Wal.FlushAsync(ct).ConfigureAwait(false);
+
+        // lokalne pomocnicze
+        static void TryDeleteFile(string path)
+        {
+            try { if (File.Exists(path)) File.Delete(path); } catch { /* best-effort */ }
+        }
     }
+
+    private void RemoveUniqueGuardsForIndex(string indexTableName)
+    {
+        // klucz guardu: "<indexTableName>|<b64(prefix)>"
+        foreach (var k in _uniqueGuards.Keys)
+            if (k.StartsWith(indexTableName + "|", StringComparison.Ordinal))
+                _uniqueGuards.TryRemove(k, out _);
+    }
+
+    public ValueTask DeleteTableAsync(string name, CancellationToken ct = default)
+    => DropTableAsync(name, ct);
+
+    public IEnumerable<string> EnumerateTableNames(bool includeIndexes = false)
+    {
+        var names = _tables.Keys.Concat(_sst.Keys).Distinct();
+        return includeIndexes ? names : names.Where(n => !n.StartsWith("__index__", StringComparison.Ordinal));
+    }
+
 
     public async ValueTask<ITimeSeriesTable<T>> OpenTimeSeriesAsync<T>(string name, TimeSeriesOptions<T> options, CancellationToken ct = default)
     {
