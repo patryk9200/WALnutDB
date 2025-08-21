@@ -3,7 +3,7 @@
 > A simple, safe embedded database for .NET 8+. Built for devices with little RAM and slow flash (SD/eMMC). It uses Write-Ahead Logging (WAL) for power-loss durability, compacts data into sorted segment files (SST), and provides secondary indexes and time-series scans. Fully managed (no native deps), cross-platform, and async by default.
 
 <p align="center">
-  <img src="logo.jpg" alt="WALnutDB mascot" width="220"/>
+  <img src="https://raw.githubusercontent.com/patryk9200/WALnutDB/refs/heads/master/logo.jpg" alt="WALnutDB mascot" width="220"/>
 </p>
 
 [![NuGet](https://img.shields.io/nuget/v/WALnutDB.svg)](https://www.nuget.org/packages/WALnutDB)
