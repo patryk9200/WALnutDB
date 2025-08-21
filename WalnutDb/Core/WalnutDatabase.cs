@@ -32,7 +32,6 @@ public sealed class WalnutDatabase : IDatabase
     internal bool IsIndexUnique(string indexTableName)
         => _indexUnique.TryGetValue(indexTableName, out var u) && u;
 
-
     public WalnutDatabase(string directory, DatabaseOptions options, IManifestStore manifest, IWalWriter wal, ITypeNameResolver? typeResolver = null)
     {
         _dir = directory;
@@ -42,8 +41,23 @@ public sealed class WalnutDatabase : IDatabase
         _typeNames = typeResolver ?? new DefaultTypeNameResolver(options);
         Directory.CreateDirectory(_dir);
 
+        // ⬇⬇⬇ NOWE: ustal właściwą ścieżkę WAL
+        string walPath = (wal is WalWriter ww && !string.IsNullOrWhiteSpace(ww.Path))
+            ? ww.Path
+            : Path.Combine(_dir, "wal.log");
+
         var recovered = new ConcurrentDictionary<string, MemTable>();
-        WalRecovery.Replay(Path.Combine(_dir, "wal.log"), recovered, _options.Encryption);
+
+        if (File.Exists(walPath))
+        {
+            try
+            {
+                WalRecovery.Replay(walPath, recovered, _options.Encryption);
+            }
+            catch
+            {
+            }
+        }
 
         foreach (var kv in recovered)
             _tables[kv.Key] = new MemTableRef(kv.Value);
@@ -70,9 +84,9 @@ public sealed class WalnutDatabase : IDatabase
                     foreach (var it in memRef.Current.SnapshotAll(null))
                     {
                         if (it.Value.Tombstone) continue;
-                        var prefix = IndexKeyCodec.ExtractValuePrefix(it.Key); // dodaj albo użyj swojego sposobu
+                        var prefix = IndexKeyCodec.ExtractValuePrefix(it.Key);
                         var pk = IndexKeyCodec.ExtractPrimaryKey(it.Key);
-                        TryReserveUnique(name, prefix, pk); // bez logów, best-effort
+                        TryReserveUnique(name, prefix, pk);
                     }
                 }
 
@@ -89,12 +103,8 @@ public sealed class WalnutDatabase : IDatabase
             }
         }
         catch { /* seed jest best-effort */ }
-
     }
 
-    // --- REZERWACJE UNIKALNE (dla indeksów Unique) ---
-
-    // Klucz: "<indexTableName>|<b64(valuePrefix)>"
     private static string MakeGuardKey(string indexTableName, byte[] valuePrefix)
         => indexTableName + "|" + Convert.ToBase64String(valuePrefix);
 

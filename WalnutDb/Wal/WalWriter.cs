@@ -24,9 +24,12 @@ public sealed class WalWriter : IWalWriter
     private readonly Crc32 _crc = new();
     private readonly SemaphoreSlim _ioGate = new(1, 1); // serializacja operacji
     private int _disposeOnce;
+    private readonly string _path;
+    public string Path => _path;
 
     public WalWriter(string path, TimeSpan? groupWindow = null, int maxBatch = 256)
     {
+        _path = path; // ⬅ zapamiętaj
         _groupWindow = groupWindow ?? TimeSpan.FromMilliseconds(25);
         _maxBatch = Math.Max(1, maxBatch);
         _queue = Channel.CreateUnbounded<WalItem>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
@@ -34,13 +37,13 @@ public sealed class WalWriter : IWalWriter
         {
             Mode = FileMode.OpenOrCreate,
             Access = FileAccess.ReadWrite,
-            Share = FileShare.Read,
+            Share = FileShare.Read, // odczyt recovery równolegle OK
             Options = FileOptions.Asynchronous | FileOptions.SequentialScan | FileOptions.WriteThrough
         });
         _fs.Seek(0, SeekOrigin.End);
         _loop = Task.Run(WriterLoopAsync);
     }
-    
+
     public async ValueTask TruncateAsync(CancellationToken ct = default)
     {
         await _ioGate.WaitAsync(ct).ConfigureAwait(false);
