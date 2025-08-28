@@ -1,5 +1,4 @@
 ﻿#nullable enable
-using System;
 using System.Buffers.Binary;
 using System.Text;
 
@@ -18,23 +17,19 @@ public static class IndexKeyCodec
             string s => Encoding.UTF8.GetBytes(s),
             Guid g => GuidToBytes(g),
 
-            // signed → bias + BE
             sbyte v => new[] { unchecked((byte)(v ^ 0x80)) },
             short v => U16(unchecked((ushort)(v ^ short.MinValue))),
             int v => U32(unchecked((uint)(v ^ int.MinValue))),
             long v => U64(unchecked((ulong)(v ^ long.MinValue))),
 
-            // unsigned → BE
             byte v => new[] { v },
             ushort v => U16(v),
             uint v => U32(v),
             ulong v => U64(v),
 
-            // float/double → sortable IEEE754
             float v => F32(v),
             double v => F64(v),
 
-            // decimal → wymagany scale
             decimal d => EncodeDecimal(d, decimalScale),
 
             _ => Encoding.UTF8.GetBytes(value.ToString() ?? string.Empty)
@@ -43,20 +38,17 @@ public static class IndexKeyCodec
 
     public static byte[] PrefixUpperBound(ReadOnlySpan<byte> prefix)
     {
-        // znajdź od końca pierwszy bajt != 0xFF i inkrementuj
         var buf = prefix.ToArray();
         for (int i = buf.Length - 1; i >= 0; i--)
         {
             if (buf[i] != 0xFF) { buf[i]++; Array.Resize(ref buf, i + 1); return buf; }
         }
-        // wszystko 0xFF → brak ścisłej górnej granicy: użyj prefix jako "do końca"
-        return Array.Empty<byte>(); // interpretujemy jako +∞ w naszych ScanRange
+        return Array.Empty<byte>();
     }
 
 
     public static byte[] ComposeIndexEntryKey(ReadOnlySpan<byte> indexKeyPrefix, ReadOnlySpan<byte> primaryKey)
     {
-        // K = indexKey || primaryKey || pkLen:u16 (BE)
         var dst = new byte[indexKeyPrefix.Length + primaryKey.Length + 2];
         indexKeyPrefix.CopyTo(dst);
         primaryKey.CopyTo(dst.AsSpan(indexKeyPrefix.Length));
@@ -64,21 +56,19 @@ public static class IndexKeyCodec
         return dst;
     }
 
-    // IndexKeyCodec.cs
     public static byte[] ExtractValuePrefix(byte[] compositeKey)
     {
         var pk = ExtractPrimaryKey(compositeKey);
-
-        // ⬇⬇⬇ odejmij jeszcze 2 bajty długości PK
         var prefixLen = compositeKey.Length - pk.Length - 2;
-        if (prefixLen < 0) prefixLen = 0;
+
+        if (prefixLen < 0)
+            prefixLen = 0;
 
         var prefix = new byte[prefixLen];
         Buffer.BlockCopy(compositeKey, 0, prefix, 0, prefixLen);
         return prefix;
     }
 
-    // i upewnij się, że ExtractPrimaryKey czyta ostatnie 2 bajty:
     public static byte[] ExtractPrimaryKey(ReadOnlySpan<byte> composite)
     {
         if (composite.Length < 2) return Array.Empty<byte>();
@@ -88,9 +78,26 @@ public static class IndexKeyCodec
         return composite.Slice(pkStart, pkLen).ToArray();
     }
 
-    private static byte[] U16(ushort v) { var b = new byte[2]; BinaryPrimitives.WriteUInt16BigEndian(b, v); return b; }
-    private static byte[] U32(uint v) { var b = new byte[4]; BinaryPrimitives.WriteUInt32BigEndian(b, v); return b; }
-    private static byte[] U64(ulong v) { var b = new byte[8]; BinaryPrimitives.WriteUInt64BigEndian(b, v); return b; }
+    private static byte[] U16(ushort v)
+    {
+        var b = new byte[2];
+        BinaryPrimitives.WriteUInt16BigEndian(b, v);
+        return b;
+    }
+
+    private static byte[] U32(uint v)
+    {
+        var b = new byte[4];
+        BinaryPrimitives.WriteUInt32BigEndian(b, v);
+        return b;
+    }
+
+    private static byte[] U64(ulong v)
+    {
+        var b = new byte[8];
+        BinaryPrimitives.WriteUInt64BigEndian(b, v);
+        return b;
+    }
 
     private static byte[] F32(float f)
     {
@@ -110,11 +117,9 @@ public static class IndexKeyCodec
         if (scale is null)
             throw new NotSupportedException("Index on decimal requires DecimalScale on DbIndexAttribute.");
 
-        // scaled = d * 10^scale, obcięte do całkowitej (bez zaokrąglania do połówek)
         var factor = Pow10(scale.Value);
         decimal scaled = decimal.Truncate(d * factor);
 
-        // zakres long? (decimal mieści się szerzej, ale na indeksie utrzymujemy 64-bit)
         const decimal min = (decimal)long.MinValue;
         const decimal max = (decimal)long.MaxValue;
         if (scaled < min || scaled > max)
@@ -127,7 +132,6 @@ public static class IndexKeyCodec
 
     private static decimal Pow10(int n)
     {
-        // n w rozsądnym zakresie (np. 0..18). Dla większych można rozszerzyć.
         return n switch
         {
             0 => 1m,
@@ -149,11 +153,10 @@ public static class IndexKeyCodec
             16 => 10000000000000000m,
             17 => 100000000000000000m,
             18 => 1000000000000000000m,
-            _ => Pow10Slow(n) // rzadko używane; OK na MVP
+            _ => Pow10Slow(n)
         };
     }
 
-    // Helper for large n
     private static decimal Pow10Slow(int n)
     {
         decimal result = 1m;
@@ -171,8 +174,9 @@ public static class IndexKeyCodec
 
     public static byte[]? NextPrefix(ReadOnlySpan<byte> prefix)
     {
-        if (prefix.Length == 0) return Array.Empty<byte>(); // „> cokolwiek” – więc brak prefiksu => unbounded
+        if (prefix.Length == 0) return Array.Empty<byte>();
         var buf = prefix.ToArray();
+
         for (int i = buf.Length - 1; i >= 0; i--)
         {
             if (buf[i] != 0xFF)
@@ -182,8 +186,7 @@ public static class IndexKeyCodec
                 return buf;
             }
         }
-        // wszystkie FF – nie istnieje ścisła kolejna wartość prefiksu; potraktuj jako „brak górnej granicy”
+
         return null;
     }
-
 }

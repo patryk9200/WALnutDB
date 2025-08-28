@@ -1,4 +1,6 @@
 ﻿#nullable enable
+using System.Runtime.CompilerServices;
+
 using WalnutDb.Indexing;
 
 namespace WalnutDb;
@@ -184,10 +186,13 @@ public interface ITable<T>
 public interface ITimeSeriesTable<T>
 {
     ValueTask AppendAsync(T sample, CancellationToken ct = default);
+
     ValueTask AppendAsync(T sample, ITransaction tx, CancellationToken ct = default);
 
     IAsyncEnumerable<T> QueryAsync(object seriesId, DateTime fromUtc, DateTime toUtc,
                                    int pageSize = 2048,
                                    ReadOnlyMemory<byte> token = default,
                                    CancellationToken ct = default);
+
+    IAsyncEnumerable<T> QueryTailAsync(string seriesId, int take, CancellationToken cancellationToken = default);
 }

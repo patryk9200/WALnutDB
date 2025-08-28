@@ -1,8 +1,5 @@
 ﻿#nullable enable
-using System;
 using System.Buffers.Binary;
-using System.Collections.Generic;
-using System.IO;
 
 namespace WalnutDb.Sst;
 
@@ -16,14 +13,11 @@ internal sealed class SstReader : IDisposable
     {
         Path = path ?? throw new ArgumentNullException(nameof(path));
 
-        // Szybka walidacja nagłówka przy konstrukcji
         using var fs = OpenRead();
         var hdr = new byte[Header.Length];
         if (fs.Read(hdr, 0, hdr.Length) != hdr.Length || !hdr.AsSpan().SequenceEqual(Header))
             throw new InvalidDataException("Invalid SST header.");
     }
-
-    // ---- Public API ----
 
     public bool TryGet(ReadOnlySpan<byte> key, out byte[]? value)
     {
@@ -96,8 +90,6 @@ internal sealed class SstReader : IDisposable
             }
         }
     }
-
-    // ---- Helpers ----
 
     private FileStream OpenRead() => new FileStream(Path, new FileStreamOptions
     {
