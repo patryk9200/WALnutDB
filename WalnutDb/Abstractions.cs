@@ -194,5 +194,5 @@ public interface ITimeSeriesTable<T>
                                    ReadOnlyMemory<byte> token = default,
                                    CancellationToken ct = default);
 
-    IAsyncEnumerable<T> QueryTailAsync(string seriesId, int take, CancellationToken cancellationToken = default);
+    IAsyncEnumerable<T> QueryTailAsync(object seriesId, int take, CancellationToken cancellationToken = default);
 }

@@ -1,9 +1,5 @@
 ﻿#nullable enable
-using System;
-using System.Collections.Generic;
 using System.Runtime.CompilerServices;
-using System.Threading;
-using System.Threading.Tasks;
 
 namespace WalnutDb.Core;
 
@@ -16,40 +12,64 @@ internal sealed class TimeSeriesTable<T> : ITimeSeriesTable<T>
     {
         _inner = inner; _mapper = mapper;
     }
+
     public async ValueTask AppendAsync(T sample, CancellationToken ct = default)
-    {
-        await _inner.UpsertAsync(sample, ct).ConfigureAwait(false);
-    }
+        => await _inner.UpsertAsync(sample, ct).ConfigureAwait(false);
 
     public async ValueTask AppendAsync(T sample, ITransaction tx, CancellationToken ct = default)
-    {
-        await _inner.UpsertAsync(sample, tx, ct).ConfigureAwait(false);
-    }
+        => await _inner.UpsertAsync(sample, tx, ct).ConfigureAwait(false);
 
-    public async IAsyncEnumerable<T> QueryAsync(object seriesId, DateTime fromUtc, DateTime toUtc, int pageSize = 2048, ReadOnlyMemory<byte> token = default, [EnumeratorCancellation] CancellationToken ct = default)
+    public async IAsyncEnumerable<T> QueryAsync(
+        object seriesId,
+        DateTime fromUtc,
+        DateTime toUtc,
+        int pageSize = 2048,
+        ReadOnlyMemory<byte> token = default,
+        [EnumeratorCancellation] CancellationToken ct = default)
     {
         var (start, endEx) = _mapper.BuildRange(seriesId, fromUtc, toUtc);
 
-        await foreach (var item in _inner.ScanByKeyAsync(start, endEx, pageSize, token, ct))
+        await foreach (var item in _inner.ScanByKeyAsync(start, endEx, pageSize, token, ct).WithCancellation(ct).ConfigureAwait(false))
+        {
             yield return item;
+        }
     }
 
-    public async IAsyncEnumerable<T> QueryTailAsync(string seriesId, int take, [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    public async IAsyncEnumerable<T> QueryTailAsync(
+        object seriesId,
+        int take,
+        [EnumeratorCancellation] CancellationToken ct = default)
     {
         if (take <= 0)
             yield break;
 
-        var ring = new Queue<T>(take);
+        var ring = new T[Math.Max(1, take)];
+        int count = 0;
+        int head = 0;
 
-        await foreach (var item in QueryAsync(seriesId: seriesId, fromUtc: DateTime.SpecifyKind(DateTime.MinValue, DateTimeKind.Utc), toUtc: DateTime.UtcNow, pageSize: 4096, ct: cancellationToken))
+        DateTime fromUtc = DateTime.SpecifyKind(DateTime.MinValue, DateTimeKind.Utc);
+        DateTime toUtc = DateTime.UtcNow;
+
+        await foreach (var item in QueryAsync(seriesId, fromUtc, toUtc, pageSize: 4096, token: default, ct: ct).WithCancellation(ct).ConfigureAwait(false))
         {
-            if (ring.Count == take)
-                ring.Dequeue();
+            ring[head] = item;
+            head = (head + 1) % ring.Length;
 
-            ring.Enqueue(item);
+            if (count < ring.Length)
+                count++;
         }
 
-        foreach (var e in ring.Reverse())
-            yield return e;
+        for (int i = 0; i < count; i++)
+        {
+            int idx = (head - 1 - i);
+
+            if (idx < 0) 
+                idx += ring.Length;
+
+            yield return ring[idx];
+        }
     }
+
+    public IAsyncEnumerable<T> QueryTailAsync(string seriesId, int take, CancellationToken ct = default)
+        => QueryTailAsync((object)seriesId, take, ct);
 }
