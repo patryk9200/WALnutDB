@@ -27,10 +27,10 @@ public sealed class WalnutDatabase : IDatabase
     private readonly ConcurrentDictionary<string, bool> _indexUnique = new(StringComparer.Ordinal);
 
     internal void RegisterIndex(string indexTableName, bool unique)
-        => _indexUnique[indexTableName] = unique;
+    => _indexUnique[CanonicalizeName(indexTableName)] = unique;
 
     internal bool IsIndexUnique(string indexTableName)
-        => _indexUnique.TryGetValue(indexTableName, out var u) && u;
+        => _indexUnique.TryGetValue(CanonicalizeName(indexTableName), out var u) && u;
 
     public WalnutDatabase(string directory, DatabaseOptions options, IManifestStore manifest, IWalWriter wal, ITypeNameResolver? typeResolver = null)
     {
@@ -65,11 +65,14 @@ public sealed class WalnutDatabase : IDatabase
         _sstDir = Path.Combine(_dir, "sst");
         Directory.CreateDirectory(_sstDir);
 
+        MigrateSstFilenamesToPlain();
+
         foreach (var file in Directory.EnumerateFiles(_sstDir, "*.sst"))
         {
             var baseName = Path.GetFileNameWithoutExtension(file);
             var logicalName = DecodeNameFromFile(baseName);
-            try { _sst[logicalName] = new SstReader(file); } catch { /* ignore */ }
+            var canonical = CanonicalizeName(logicalName);
+            try { _sst[canonical] = new SstReader(file); } catch { /* ignore */ }
         }
 
         try
@@ -103,6 +106,57 @@ public sealed class WalnutDatabase : IDatabase
             }
         }
         catch { /* seed jest best-effort */ }
+    }
+
+    private void MigrateSstFilenamesToPlain()
+    {
+        // zbierz „stemy” (X dla X.sst / X.sst.sxi / X.sst.tmp)
+        var stems = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var file in Directory.EnumerateFiles(_sstDir))
+        {
+            var fn = Path.GetFileName(file);
+            if (fn.EndsWith(".sst.tmp", StringComparison.OrdinalIgnoreCase))
+                stems.Add(fn[..^(".sst.tmp".Length)]);
+            else if (fn.EndsWith(".sst.sxi", StringComparison.OrdinalIgnoreCase))
+                stems.Add(fn[..^(".sst.sxi".Length)]);
+            else if (fn.EndsWith(".sst", StringComparison.OrdinalIgnoreCase))
+                stems.Add(fn[..^(".sst".Length)]);
+        }
+
+        foreach (var oldStem in stems)
+        {
+            // jeśli to base64-url (kanonicznie) → zdekoduj; inaczej zostaw
+            if (!TryDecodeBase64UrlRoundtrip(oldStem, out var logical))
+                continue;
+
+            var newStem = EncodeNameToFile(logical);
+            if (string.Equals(oldStem, newStem, StringComparison.Ordinal)) continue;
+
+            // przenieś rodzinę plików (best-effort)
+            TryMove($"{oldStem}.sst", $"{newStem}.sst");
+            TryMove($"{oldStem}.sst.sxi", $"{newStem}.sst.sxi");
+            TryMove($"{oldStem}.sst.tmp", $"{newStem}.sst.tmp");
+        }
+
+        void TryMove(string relSrc, string relDst)
+        {
+            var src = Path.Combine(_sstDir, relSrc);
+            if (!File.Exists(src)) return;
+            var dst = Path.Combine(_sstDir, relDst);
+
+            try
+            {
+                if (File.Exists(dst))
+                {
+                    // uniknij kolizji
+                    var unique = Path.Combine(_sstDir,
+                        Path.GetFileNameWithoutExtension(relDst) + $"--{Guid.NewGuid():N}" + Path.GetExtension(relDst));
+                    dst = unique;
+                }
+                File.Move(src, dst);
+            }
+            catch { /* best-effort */ }
+        }
     }
 
     private static string MakeGuardKey(string indexTableName, byte[] valuePrefix)
@@ -319,21 +373,94 @@ public sealed class WalnutDatabase : IDatabase
         _sst[name] = reader;
     }
 
+    private static readonly HashSet<string> _reservedWin = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "CON","PRN","AUX","NUL","COM1","COM2","COM3","COM4","COM5","COM6","COM7","COM8","COM9",
+        "LPT1","LPT2","LPT3","LPT4","LPT5","LPT6","LPT7","LPT8","LPT9"
+    };
+
+    private static string CanonicalizeName(string raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return "_";
+        var sb = new StringBuilder(raw.Length);
+        foreach (var ch in raw)
+        {
+            if (char.IsLetterOrDigit(ch) || ch == '_' || ch == '-' || ch == '.')
+                sb.Append(ch);
+            else
+                sb.Append('_'); // zamiana wszystkich niedozwolonych na _
+        }
+        var s = sb.ToString().Trim();
+        s = s.TrimEnd('.', ' ');                 // Windows nie lubi kropki/spacji na końcu
+        if (s.Length == 0) s = "_";
+        if (_reservedWin.Contains(s)) s = "_" + s;
+        if (s.Length > 180) s = s.Substring(0, 180); // rozsądny limit
+        return s;
+    }
+
+    private static bool TryDecodeLegacyBase64Url(string fileBaseName, out string logical)
+    {
+        logical = "";
+        // szybki filtr alfabetu Base64-url
+        foreach (var c in fileBaseName)
+            if (!(char.IsLetterOrDigit(c) || c == '-' || c == '_'))
+                return false;
+        try
+        {
+            var s = fileBaseName.Replace('-', '+').Replace('_', '/');
+            switch (s.Length % 4) { case 2: s += "=="; break; case 3: s += "="; break; }
+            var bytes = Convert.FromBase64String(s);
+            // round-trip: tylko jeśli wraca identycznie – to było nasze stare kodowanie
+            var rt = Convert.ToBase64String(bytes).Replace('+', '-').Replace('/', '_').TrimEnd('=');
+            if (rt != fileBaseName) return false;
+            logical = Encoding.UTF8.GetString(bytes);
+            return true;
+        }
+        catch { return false; }
+    }
+
     private static string EncodeNameToFile(string logicalName)
     {
-        // Base64-url bez paddingu: tylko [A-Za-z0-9-_]
-        var bytes = Encoding.UTF8.GetBytes(logicalName);
-        var b64 = Convert.ToBase64String(bytes).Replace('+', '-').Replace('/', '_').TrimEnd('=');
-        return b64;
+        // od teraz zapisujemy JAWNIE – ale zawsze „file-safe”
+        return CanonicalizeName(logicalName);
     }
+
     private static string DecodeNameFromFile(string fileBaseName)
     {
-        var s = fileBaseName.Replace('-', '+').Replace('_', '/');
-        // przywróć padding
-        switch (s.Length % 4) { case 2: s += "=="; break; case 3: s += "="; break; }
-        var bytes = Convert.FromBase64String(s);
-        return Encoding.UTF8.GetString(bytes);
+        // wstecznie: jeśli stary Base64-url – zdekoduj do logicznej nazwy,
+        // w przeciwnym wypadku to już nazwa jawna
+        if (TryDecodeLegacyBase64Url(fileBaseName, out var legacy))
+            return legacy;
+        return fileBaseName;
     }
+
+    private static string ToBase64UrlNoPad(byte[] bytes)
+    => Convert.ToBase64String(bytes).Replace('+', '-').Replace('/', '_').TrimEnd('=');
+
+    private static bool TryDecodeBase64UrlRoundtrip(string s, out string decoded)
+    {
+        decoded = "";
+        try
+        {
+            // przywróć standardowe znaki i padding
+            string std = s.Replace('-', '+').Replace('_', '/');
+            int mod = std.Length % 4;
+            if (mod == 1) return false;       // to nie może być Base64
+            if (mod == 2) std += "==";
+            else if (mod == 3) std += "=";
+
+            var bytes = Convert.FromBase64String(std);
+
+            // kanoniczne ponowne kodowanie do base64-url (bez '=') musi dać dokładnie to samo
+            string again = ToBase64UrlNoPad(bytes);
+            if (!string.Equals(again, s, StringComparison.Ordinal)) return false;
+
+            decoded = Encoding.UTF8.GetString(bytes);
+            return true;
+        }
+        catch { return false; }
+    }
+
 
     public async ValueTask CheckpointAsync(CancellationToken ct = default)
     {
@@ -667,9 +794,10 @@ public sealed class WalnutDatabase : IDatabase
 
     public async ValueTask<ITable<T>> OpenTableAsync<T>(string name, TableOptions<T> options, CancellationToken ct = default)
     {
-        var memRef = GetOrAddMemRef(name);
+        var canonical = CanonicalizeName(name);
+        var memRef = GetOrAddMemRef(canonical);
         await Task.Yield();
-        return new DefaultTable<T>(this, name, options, memRef);
+        return new DefaultTable<T>(this, canonical, options, memRef);
     }
 
     public ValueTask<ITable<T>> OpenTableAsync<T>(TableOptions<T> options, CancellationToken ct = default)
@@ -755,23 +883,19 @@ public sealed class WalnutDatabase : IDatabase
         return includeIndexes ? names : names.Where(n => !n.StartsWith("__index__", StringComparison.Ordinal));
     }
 
-
     public async ValueTask<ITimeSeriesTable<T>> OpenTimeSeriesAsync<T>(string name, TimeSeriesOptions<T> options, CancellationToken ct = default)
     {
+        var canonical = CanonicalizeName(name);
         var mapper = new TimeSeriesMapper<T>(options);
-
-        // Tabela przechowuje klucz TS jako byte[] zwrócony przez mapper.BuildKey
-        var tbl = await OpenTableAsync<T>(name, new TableOptions<T>
+        var tbl = await OpenTableAsync<T>(canonical, new TableOptions<T>
         {
-            GetId = (T item) => (object)mapper.BuildKey(item), // byte[] jako ID
+            GetId = (T item) => (object)mapper.BuildKey(item),
             Serialize = options.Serialize,
             Deserialize = options.Deserialize,
             StoreGuidStringsAsBinary = true
         }, ct).ConfigureAwait(false);
-
         return new TimeSeriesTable<T>(tbl, mapper);
     }
-
 
     public ValueTask<ITimeSeriesTable<T>> OpenTimeSeriesAsync<T>(TimeSeriesOptions<T> options, CancellationToken ct = default)
         => OpenTimeSeriesAsync<T>(_typeNames.Resolve(typeof(T)), options, ct);
