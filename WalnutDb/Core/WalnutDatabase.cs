@@ -388,13 +388,11 @@ public sealed class WalnutDatabase : IDatabase
             if (char.IsLetterOrDigit(ch) || ch == '_' || ch == '-' || ch == '.')
                 sb.Append(ch);
             else
-                sb.Append('_'); // zamiana wszystkich niedozwolonych na _
+                sb.Append('_'); // zamień znaki niedozwolone w nazwach plików Windows/Unix
         }
-        var s = sb.ToString().Trim();
-        s = s.TrimEnd('.', ' ');                 // Windows nie lubi kropki/spacji na końcu
+        var s = sb.ToString().Trim().TrimEnd('.', ' ');
         if (s.Length == 0) s = "_";
-        if (_reservedWin.Contains(s)) s = "_" + s;
-        if (s.Length > 180) s = s.Substring(0, 180); // rozsądny limit
+        if (s.Length > 180) s = s.Substring(0, 180);
         return s;
     }
 
@@ -405,14 +403,18 @@ public sealed class WalnutDatabase : IDatabase
         foreach (var c in fileBaseName)
             if (!(char.IsLetterOrDigit(c) || c == '-' || c == '_'))
                 return false;
+
         try
         {
             var s = fileBaseName.Replace('-', '+').Replace('_', '/');
             switch (s.Length % 4) { case 2: s += "=="; break; case 3: s += "="; break; }
             var bytes = Convert.FromBase64String(s);
-            // round-trip: tylko jeśli wraca identycznie – to było nasze stare kodowanie
+
+            // round-trip — MUSI wyjść identycznie
             var rt = Convert.ToBase64String(bytes).Replace('+', '-').Replace('/', '_').TrimEnd('=');
             if (rt != fileBaseName) return false;
+
+            // musi być poprawne UTF-8
             logical = Encoding.UTF8.GetString(bytes);
             return true;
         }
@@ -421,17 +423,17 @@ public sealed class WalnutDatabase : IDatabase
 
     private static string EncodeNameToFile(string logicalName)
     {
-        // od teraz zapisujemy JAWNIE – ale zawsze „file-safe”
+        // od teraz zapisujemy jawnie, ale „file-safe”
         return CanonicalizeName(logicalName);
     }
 
     private static string DecodeNameFromFile(string fileBaseName)
     {
-        // wstecznie: jeśli stary Base64-url – zdekoduj do logicznej nazwy,
-        // w przeciwnym wypadku to już nazwa jawna
-        if (TryDecodeLegacyBase64Url(fileBaseName, out var legacy))
-            return legacy;
-        return fileBaseName;
+        // wstecz: jeśli to legacy Base64-url → zwróć logiczną nazwę,
+        // inaczej to już jawna nazwa (po prostu ją zwróć)
+        return TryDecodeLegacyBase64Url(fileBaseName, out var legacy)
+            ? legacy
+            : fileBaseName;
     }
 
     private static string ToBase64UrlNoPad(byte[] bytes)
