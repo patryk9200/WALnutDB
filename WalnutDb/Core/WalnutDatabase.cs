@@ -65,7 +65,7 @@ public sealed class WalnutDatabase : IDatabase
         _sstDir = Path.Combine(_dir, "sst");
         Directory.CreateDirectory(_sstDir);
 
-        MigrateSstFilenamesToPlain();
+        MigrateSstFilenames();
 
         foreach (var file in Directory.EnumerateFiles(_sstDir, "*.sst"))
         {
@@ -108,54 +108,64 @@ public sealed class WalnutDatabase : IDatabase
         catch { /* seed jest best-effort */ }
     }
 
-    private void MigrateSstFilenamesToPlain()
+    private void MigrateSstFilenames()
     {
-        // zbierz „stemy” (X dla X.sst / X.sst.sxi / X.sst.tmp)
-        var stems = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var file in Directory.EnumerateFiles(_sstDir))
+        // snapshot list plików, żeby zmiany nazw nie mieszały enumeracji
+        var sstFiles = Directory.GetFiles(_sstDir, "*.sst");
+        foreach (var sstPath in sstFiles)
         {
-            var fn = Path.GetFileName(file);
-            if (fn.EndsWith(".sst.tmp", StringComparison.OrdinalIgnoreCase))
-                stems.Add(fn[..^(".sst.tmp".Length)]);
-            else if (fn.EndsWith(".sst.sxi", StringComparison.OrdinalIgnoreCase))
-                stems.Add(fn[..^(".sst.sxi".Length)]);
-            else if (fn.EndsWith(".sst", StringComparison.OrdinalIgnoreCase))
-                stems.Add(fn[..^(".sst".Length)]);
+            var baseName = Path.GetFileNameWithoutExtension(sstPath);
+            var logical = DecodeNameFromFile(baseName);          // stara nazwa: jawna lub Base64-url
+            var canonical = CanonicalizeName(logical);              // kanonizacja do bezpiecznej jawnej
+            var prefer = EncodeNameToFile(canonical);            // zapis: jawnie (albo Base64 jeśli MUSI)
+
+            if (!string.Equals(prefer, baseName, StringComparison.Ordinal))
+            {
+                var newSst = Path.Combine(_sstDir, prefer + ".sst");
+                SafeMoveReplacing(sstPath, newSst);
+
+                var oldSxi = sstPath + ".sxi";
+                var newSxi = newSst + ".sxi";
+                if (File.Exists(oldSxi)) SafeMoveReplacing(oldSxi, newSxi);
+            }
         }
 
-        foreach (var oldStem in stems)
+        // „trupy” *.sst.tmp – też przenosimy do jawnych nazw
+        var tmpFiles = Directory.GetFiles(_sstDir, "*.sst.tmp");
+        foreach (var tmpPath in tmpFiles)
         {
-            // jeśli to base64-url (kanonicznie) → zdekoduj; inaczej zostaw
-            if (!TryDecodeBase64UrlRoundtrip(oldStem, out var logical))
-                continue;
+            var fn = Path.GetFileName(tmpPath);                   // np. "ZGF...=.sst.tmp" albo "devices.sst.tmp"
+            var stem = fn.Substring(0, fn.Length - ".sst.tmp".Length);
+            var logical = DecodeNameFromFile(stem);
+            var canonical = CanonicalizeName(logical);
+            var prefer = EncodeNameToFile(canonical);
 
-            var newStem = EncodeNameToFile(logical);
-            if (string.Equals(oldStem, newStem, StringComparison.Ordinal)) continue;
-
-            // przenieś rodzinę plików (best-effort)
-            TryMove($"{oldStem}.sst", $"{newStem}.sst");
-            TryMove($"{oldStem}.sst.sxi", $"{newStem}.sst.sxi");
-            TryMove($"{oldStem}.sst.tmp", $"{newStem}.sst.tmp");
+            if (!string.Equals(prefer, stem, StringComparison.Ordinal))
+            {
+                var newTmp = Path.Combine(_sstDir, prefer + ".sst.tmp");
+                SafeMoveReplacing(tmpPath, newTmp);
+            }
         }
 
-        void TryMove(string relSrc, string relDst)
+        static void SafeMoveReplacing(string src, string dst)
         {
-            var src = Path.Combine(_sstDir, relSrc);
-            if (!File.Exists(src)) return;
-            var dst = Path.Combine(_sstDir, relDst);
-
             try
             {
+                Directory.CreateDirectory(Path.GetDirectoryName(dst)!);
                 if (File.Exists(dst))
                 {
-                    // uniknij kolizji
-                    var unique = Path.Combine(_sstDir,
-                        Path.GetFileNameWithoutExtension(relDst) + $"--{Guid.NewGuid():N}" + Path.GetExtension(relDst));
-                    dst = unique;
+                    // Preferujemy nowszy/docelowy – źródłowy kasujemy (best-effort).
+                    try { File.Delete(src); } catch { }
                 }
-                File.Move(src, dst);
+                else
+                {
+                    File.Move(src, dst);
+                }
             }
-            catch { /* best-effort */ }
+            catch
+            {
+                // best-effort
+            }
         }
     }
 
@@ -373,12 +383,6 @@ public sealed class WalnutDatabase : IDatabase
         _sst[name] = reader;
     }
 
-    private static readonly HashSet<string> _reservedWin = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "CON","PRN","AUX","NUL","COM1","COM2","COM3","COM4","COM5","COM6","COM7","COM8","COM9",
-        "LPT1","LPT2","LPT3","LPT4","LPT5","LPT6","LPT7","LPT8","LPT9"
-    };
-
     private static string CanonicalizeName(string raw)
     {
         if (string.IsNullOrWhiteSpace(raw)) return "_";
@@ -396,44 +400,65 @@ public sealed class WalnutDatabase : IDatabase
         return s;
     }
 
-    private static bool TryDecodeLegacyBase64Url(string fileBaseName, out string logical)
-    {
-        logical = "";
-        // szybki filtr alfabetu Base64-url
-        foreach (var c in fileBaseName)
-            if (!(char.IsLetterOrDigit(c) || c == '-' || c == '_'))
-                return false;
+    // --- NAME ENCODING -----------------------------------------------------------
 
+    private static readonly char[] InvalidFileChars = Path.GetInvalidFileNameChars();
+    private static readonly HashSet<string> WindowsReserved = new(StringComparer.OrdinalIgnoreCase)
+{
+    "CON","PRN","AUX","NUL",
+    "COM1","COM2","COM3","COM4","COM5","COM6","COM7","COM8","COM9",
+    "LPT1","LPT2","LPT3","LPT4","LPT5","LPT6","LPT7","LPT8","LPT9"
+};
+
+    private static bool IsSafeFileName(string name)
+    {
+        if (string.IsNullOrWhiteSpace(name)) return false;
+        if (name.IndexOfAny(InvalidFileChars) >= 0) return false;
+        if (name.Length > 120) return false; // margines na rozszerzenia
+        if (name.TrimEnd().EndsWith(".", StringComparison.Ordinal)) return false;
+        if (WindowsReserved.Contains(name)) return false;
+        return true;
+    }
+
+    private static string Base64UrlEncode(string logicalName)
+    {
+        var bytes = Encoding.UTF8.GetBytes(logicalName);
+        return Convert.ToBase64String(bytes).Replace('+', '-').Replace('/', '_').TrimEnd('=');
+    }
+
+    private static bool TryBase64UrlDecode(string fileBaseName, out string decoded)
+    {
+        decoded = "";
         try
         {
             var s = fileBaseName.Replace('-', '+').Replace('_', '/');
             switch (s.Length % 4) { case 2: s += "=="; break; case 3: s += "="; break; }
             var bytes = Convert.FromBase64String(s);
-
-            // round-trip — MUSI wyjść identycznie
-            var rt = Convert.ToBase64String(bytes).Replace('+', '-').Replace('/', '_').TrimEnd('=');
-            if (rt != fileBaseName) return false;
-
-            // musi być poprawne UTF-8
-            logical = Encoding.UTF8.GetString(bytes);
+            // Wymuś błąd przy niepoprawnym UTF-8 (żeby nie „połknąć” śmieci)
+            decoded = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true)
+                          .GetString(bytes);
             return true;
         }
-        catch { return false; }
+        catch
+        {
+            return false;
+        }
     }
 
     private static string EncodeNameToFile(string logicalName)
     {
-        // od teraz zapisujemy jawnie, ale „file-safe”
-        return CanonicalizeName(logicalName);
+        // Jawnie, jeśli nazwa jest bezpieczna dla FS; inaczej Base64-url bez paddingu.
+        return IsSafeFileName(logicalName) ? logicalName : Base64UrlEncode(logicalName);
     }
 
     private static string DecodeNameFromFile(string fileBaseName)
     {
-        // wstecz: jeśli to legacy Base64-url → zwróć logiczną nazwę,
-        // inaczej to już jawna nazwa (po prostu ją zwróć)
-        return TryDecodeLegacyBase64Url(fileBaseName, out var legacy)
-            ? legacy
-            : fileBaseName;
+        // Rozpoznaj „prawdziwe” Base64-url: dekoduj i sprawdź round-trip do identycznego ciągu.
+        if (TryDecodeBase64UrlRoundtrip(fileBaseName, out var decoded))
+            return decoded;
+
+        // W przeciwnym razie traktuj nazwę jako jawną.
+        return fileBaseName;
     }
 
     private static string ToBase64UrlNoPad(byte[] bytes)
@@ -807,6 +832,7 @@ public sealed class WalnutDatabase : IDatabase
 
     public async ValueTask DropTableAsync(string name, CancellationToken ct = default)
     {
+
         // single-writer na czas modyfikacji struktur
         await WriterLock.WaitAsync(ct).ConfigureAwait(false);
         try
