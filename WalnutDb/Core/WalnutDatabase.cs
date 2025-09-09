@@ -53,14 +53,12 @@ public sealed class WalnutDatabase : IDatabase
             try
             {
                 WalRecovery.Replay(walPath, recovered, _options.Encryption);
+                AdoptRecoveredTables(recovered);
             }
             catch
             {
             }
         }
-
-        foreach (var kv in recovered)
-            _tables[kv.Key] = new MemTableRef(kv.Value);
 
         _sstDir = Path.Combine(_dir, "sst");
         Directory.CreateDirectory(_sstDir);
@@ -104,20 +102,50 @@ public sealed class WalnutDatabase : IDatabase
                     }
                 }
             }
+
+            foreach (var n in _sst.Keys.Except(_tables.Keys))
+                Console.WriteLine($"[SST only] {n}");
+
+            foreach (var n in _tables.Keys.Except(_sst.Keys))
+                Console.WriteLine($"[Mem only] {n}");
         }
         catch { /* seed jest best-effort */ }
     }
 
+    private void AdoptRecoveredTables(ConcurrentDictionary<string, MemTable> recovered)
+    {
+        foreach (var kv in recovered)
+        {
+            var canonical = CanonicalizeName(kv.Key);
+
+            if (_tables.TryGetValue(canonical, out var existing))
+            {
+                // Zmerguj zawartość z odzyskanej memki do istniejącej (upserty/tombstony)
+                foreach (var it in kv.Value.SnapshotAll(afterKeyExclusive: null))
+                {
+                    if (it.Value.Tombstone)
+                        existing.Current.Delete(it.Key);
+                    else if (it.Value.Value is not null)
+                        existing.Current.Upsert(it.Key, it.Value.Value);
+                }
+            }
+            else
+            {
+                _tables[canonical] = new MemTableRef(kv.Value);
+            }
+        }
+    }
+
     private void MigrateSstFilenames()
     {
-        // snapshot list plików, żeby zmiany nazw nie mieszały enumeracji
+        // --- 1) *.sst (+ ich *.sst.sxi) ---
         var sstFiles = Directory.GetFiles(_sstDir, "*.sst");
         foreach (var sstPath in sstFiles)
         {
             var baseName = Path.GetFileNameWithoutExtension(sstPath);
-            var logical = DecodeNameFromFile(baseName);          // stara nazwa: jawna lub Base64-url
-            var canonical = CanonicalizeName(logical);              // kanonizacja do bezpiecznej jawnej
-            var prefer = EncodeNameToFile(canonical);            // zapis: jawnie (albo Base64 jeśli MUSI)
+            var logical = DecodeNameFromFile(baseName);
+            var canonical = CanonicalizeName(logical);
+            var prefer = EncodeNameToFile(canonical);
 
             if (!string.Equals(prefer, baseName, StringComparison.Ordinal))
             {
@@ -130,11 +158,11 @@ public sealed class WalnutDatabase : IDatabase
             }
         }
 
-        // „trupy” *.sst.tmp – też przenosimy do jawnych nazw
+        // --- 2) *.sst.tmp  (pozostałości po zapisie; tylko zmiana bazy nazwy) ---
         var tmpFiles = Directory.GetFiles(_sstDir, "*.sst.tmp");
         foreach (var tmpPath in tmpFiles)
         {
-            var fn = Path.GetFileName(tmpPath);                   // np. "ZGF...=.sst.tmp" albo "devices.sst.tmp"
+            var fn = Path.GetFileName(tmpPath);                    // np. "devices.sst.tmp" lub "ZGF...=.sst.tmp"
             var stem = fn.Substring(0, fn.Length - ".sst.tmp".Length);
             var logical = DecodeNameFromFile(stem);
             var canonical = CanonicalizeName(logical);
@@ -147,6 +175,23 @@ public sealed class WalnutDatabase : IDatabase
             }
         }
 
+        // --- 3) *.sst.tmp.sxi  (indeks do pliku tymczasowego) ---
+        var tmpSxiFiles = Directory.GetFiles(_sstDir, "*.sst.tmp.sxi");
+        foreach (var sxiPath in tmpSxiFiles)
+        {
+            var fn = Path.GetFileName(sxiPath);                    // np. "devices.sst.tmp.sxi" lub "ZGF...=.sst.tmp.sxi"
+            var stem = fn.Substring(0, fn.Length - ".sst.tmp.sxi".Length);
+            var logical = DecodeNameFromFile(stem);
+            var canonical = CanonicalizeName(logical);
+            var prefer = EncodeNameToFile(canonical);
+
+            if (!string.Equals(prefer, stem, StringComparison.Ordinal))
+            {
+                var newSxi = Path.Combine(_sstDir, prefer + ".sst.tmp.sxi");
+                SafeMoveReplacing(sxiPath, newSxi);
+            }
+        }
+
         static void SafeMoveReplacing(string src, string dst)
         {
             try
@@ -154,7 +199,7 @@ public sealed class WalnutDatabase : IDatabase
                 Directory.CreateDirectory(Path.GetDirectoryName(dst)!);
                 if (File.Exists(dst))
                 {
-                    // Preferujemy nowszy/docelowy – źródłowy kasujemy (best-effort).
+                    // Preferujemy docelowy – źródłowy sprzątamy (best-effort).
                     try { File.Delete(src); } catch { }
                 }
                 else
@@ -162,10 +207,7 @@ public sealed class WalnutDatabase : IDatabase
                     File.Move(src, dst);
                 }
             }
-            catch
-            {
-                // best-effort
-            }
+            catch { /* best-effort */ }
         }
     }
 
@@ -320,17 +362,14 @@ public sealed class WalnutDatabase : IDatabase
         return false;
     }
 
-    // Klucz: "<indexTableName>|<b64(valuePrefix)>"
-    private static string MakeGuardKey(string indexTableName, ReadOnlySpan<byte> valuePrefix)
-        => indexTableName + "|" + Convert.ToBase64String(valuePrefix);
-
     internal bool IsUniqueOwner(string indexTableName, ReadOnlySpan<byte> prefix, ReadOnlySpan<byte> pk)
     {
-        var gk = MakeGuardKey(indexTableName, prefix.ToArray());
-        if (_uniqueGuards.TryGetValue(gk, out var owner))
-            return ByteArrayComparer.Instance.Equals(owner, pk.ToArray());
-        return false;
+        var gk = MakeGuardKey(indexTableName, prefix);
+        return _uniqueGuards.TryGetValue(gk, out var owner) && ByteArrayEquals(owner, pk);
     }
+
+    private static string MakeGuardKey(string indexTableName, ReadOnlySpan<byte> valuePrefix)
+        => indexTableName + "|" + Convert.ToBase64String(valuePrefix);
 
     internal IEnumerable<(byte[] Key, byte[] Val)> ScanSstRange(string name, byte[] fromInclusive, byte[] toExclusive)
     {
@@ -426,25 +465,6 @@ public sealed class WalnutDatabase : IDatabase
         return Convert.ToBase64String(bytes).Replace('+', '-').Replace('/', '_').TrimEnd('=');
     }
 
-    private static bool TryBase64UrlDecode(string fileBaseName, out string decoded)
-    {
-        decoded = "";
-        try
-        {
-            var s = fileBaseName.Replace('-', '+').Replace('_', '/');
-            switch (s.Length % 4) { case 2: s += "=="; break; case 3: s += "="; break; }
-            var bytes = Convert.FromBase64String(s);
-            // Wymuś błąd przy niepoprawnym UTF-8 (żeby nie „połknąć” śmieci)
-            decoded = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true)
-                          .GetString(bytes);
-            return true;
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
     private static string EncodeNameToFile(string logicalName)
     {
         // Jawnie, jeśli nazwa jest bezpieczna dla FS; inaczej Base64-url bez paddingu.
@@ -453,23 +473,20 @@ public sealed class WalnutDatabase : IDatabase
 
     private static string DecodeNameFromFile(string fileBaseName)
     {
-        // Rozpoznaj „prawdziwe” Base64-url: dekoduj i sprawdź round-trip do identycznego ciągu.
+        // Rozpoznaj *kanoniczne* Base64-url: dekoduj bajty, sprawdź round-trip do identycznego ciągu
+        // i zaakceptuj TYLKO gdy UTF-8 jest poprawny.
         if (TryDecodeBase64UrlRoundtrip(fileBaseName, out var decoded))
             return decoded;
 
-        // W przeciwnym razie traktuj nazwę jako jawną.
+        // Nie jest prawidłowym Base64-url → traktuj jako jawną nazwę.
         return fileBaseName;
     }
-
-    private static string ToBase64UrlNoPad(byte[] bytes)
-    => Convert.ToBase64String(bytes).Replace('+', '-').Replace('/', '_').TrimEnd('=');
 
     private static bool TryDecodeBase64UrlRoundtrip(string s, out string decoded)
     {
         decoded = "";
         try
         {
-            // przywróć standardowe znaki i padding
             string std = s.Replace('-', '+').Replace('_', '/');
             int mod = std.Length % 4;
             if (mod == 1) return false;       // to nie może być Base64
@@ -478,16 +495,20 @@ public sealed class WalnutDatabase : IDatabase
 
             var bytes = Convert.FromBase64String(std);
 
-            // kanoniczne ponowne kodowanie do base64-url (bez '=') musi dać dokładnie to samo
+            // round-trip do *identycznego* base64-url bez '='
             string again = ToBase64UrlNoPad(bytes);
             if (!string.Equals(again, s, StringComparison.Ordinal)) return false;
 
-            decoded = Encoding.UTF8.GetString(bytes);
+            // Wymuś poprawny UTF-8 (żadnych znaków zamienników)
+            decoded = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true)
+                          .GetString(bytes);
             return true;
         }
         catch { return false; }
     }
 
+    private static string ToBase64UrlNoPad(byte[] bytes)
+    => Convert.ToBase64String(bytes).Replace('+', '-').Replace('/', '_').TrimEnd('=');
 
     public async ValueTask CheckpointAsync(CancellationToken ct = default)
     {
@@ -594,14 +615,16 @@ public sealed class WalnutDatabase : IDatabase
         await Wal.TruncateAsync(ct).ConfigureAwait(false);
     }
 
-
     public ValueTask<DbStats> GetStatsAsync(CancellationToken ct = default)
     {
-        // WAL
-        var walPath = Path.Combine(_dir, "wal.log");
-        long walBytes = File.Exists(walPath) ? new FileInfo(walPath).Length : 0;
+        // WAL: użyj ścieżki z WalWriter, jeśli dostępna
+        string walPath = (Wal is WalWriter ww && !string.IsNullOrWhiteSpace(ww.Path))
+            ? ww.Path
+            : Path.Combine(_dir, "wal.log");
 
-        // zbuduj zbiór logicznych nazw tabel (z Mem i z SST)
+        long walBytes = 0;
+        try { walBytes = File.Exists(walPath) ? new FileInfo(walPath).Length : 0; } catch { /* best-effort */ }
+
         var names = new HashSet<string>(_tables.Keys);
         foreach (var n in _sst.Keys) names.Add(n);
 
@@ -618,7 +641,6 @@ public sealed class WalnutDatabase : IDatabase
             int sstCount = 0;
             long sstSizeBytes = 0;
 
-            // Mem: policz live/dead (po prostu liczymy bajty Value; klucze pomijamy)
             if (_tables.TryGetValue(name, out var memRef))
             {
                 foreach (var kv in memRef.Current.SnapshotAll(afterKeyExclusive: null))
@@ -628,12 +650,11 @@ public sealed class WalnutDatabase : IDatabase
                 }
             }
 
-            // SST: policz live (cały plik skanujemy – MVP)
             if (_sst.TryGetValue(name, out var sst))
             {
                 sstCount = 1;
                 try { sstSizeBytes = new FileInfo(sst.Path).Length; } catch { /* ignore */ }
-                // policz Value bajty
+
                 foreach (var kv in sst.ScanRange(Array.Empty<byte>(), Array.Empty<byte>()))
                     live += kv.Val.LongLength;
             }
@@ -643,7 +664,7 @@ public sealed class WalnutDatabase : IDatabase
 
             double frag = (live + dead) > 0 ? (double)dead / (live + dead) * 100.0 : 0.0;
             tables.Add(new TableStats(name,
-                TotalBytes: sstSizeBytes + live, // w Total liczymy rozmiar SST + żywe w mem (MVP)
+                TotalBytes: sstSizeBytes + live,
                 LiveBytes: live,
                 DeadBytes: dead,
                 SstCount: sstCount,
@@ -664,7 +685,7 @@ public sealed class WalnutDatabase : IDatabase
         var targetSstDir = Path.Combine(targetDir, "sst");
         Directory.CreateDirectory(targetSstDir);
 
-        // 1) Zrób nsync WAL (z gwarancją spójności ramek do tego punktu)
+        // 1) Trwały flush WAL do bieżącego pliku
         await Wal.FlushAsync(ct).ConfigureAwait(false);
 
         long copied = 0;
@@ -682,8 +703,11 @@ public sealed class WalnutDatabase : IDatabase
             }
         }
 
-        // 3) Skopiuj WAL (wal.log)
-        var walPath = Path.Combine(_dir, "wal.log");
+        // 3) Skopiuj WAL (użyj ścieżki z WalWriter, jeśli dostępna)
+        string walPath = (Wal is WalWriter ww && !string.IsNullOrWhiteSpace(ww.Path))
+            ? ww.Path
+            : Path.Combine(_dir, "wal.log");
+
         if (File.Exists(walPath))
         {
             var dst = Path.Combine(targetDir, "wal.log");
@@ -695,12 +719,12 @@ public sealed class WalnutDatabase : IDatabase
             }
         }
 
-        // (opcjonalnie) meta/manifest – jeśli masz pliki manifestu, przekopiuj je też
+        // (opcjonalnie) manifesty
         foreach (var mf in Directory.EnumerateFiles(_dir, "*.manifest"))
         {
             var dst = Path.Combine(targetDir, Path.GetFileName(mf));
             File.Copy(mf, dst, overwrite: true);
-            copied += new FileInfo(mf).Length;
+            try { copied += new FileInfo(mf).Length; } catch { /* best-effort */ }
         }
 
         return new BackupResult(targetDir, copied);
@@ -832,15 +856,13 @@ public sealed class WalnutDatabase : IDatabase
 
     public async ValueTask DropTableAsync(string name, CancellationToken ct = default)
     {
+        name = CanonicalizeName(name); // <-- dodaj
 
-        // single-writer na czas modyfikacji struktur
         await WriterLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            // 1) zabij memkę tabeli
             _tables.TryRemove(name, out _);
 
-            // 2) zamknij i usuń SST
             if (_sst.TryRemove(name, out var sst))
             {
                 try { sst.Dispose(); } catch { /* ignore */ }
@@ -852,8 +874,7 @@ public sealed class WalnutDatabase : IDatabase
             TryDeleteFile(sstPath);
             TryDeleteFile(tmpPath);
 
-            // 3) usuń wszystkie indeksy tej tabeli
-            var idxPrefix = $"__index__{name}__"; // taki mamy schemat nazewnictwa
+            var idxPrefix = $"__index__{name}__";
             var indexNames = _tables.Keys
                 .Concat(_sst.Keys)
                 .Where(n => n.StartsWith(idxPrefix, StringComparison.Ordinal))
@@ -862,10 +883,8 @@ public sealed class WalnutDatabase : IDatabase
 
             foreach (var idxName in indexNames)
             {
-                // mem
                 _tables.TryRemove(idxName, out _);
 
-                // sst
                 if (_sst.TryRemove(idxName, out var idxSst))
                     try { idxSst.Dispose(); } catch { }
 
@@ -873,12 +892,9 @@ public sealed class WalnutDatabase : IDatabase
                 TryDeleteFile(Path.Combine(_sstDir, $"{idxSafe}.sst"));
                 TryDeleteFile(Path.Combine(_sstDir, $"{idxSafe}.sst.tmp"));
 
-                // guardy unikalności
                 RemoveUniqueGuardsForIndex(idxName);
                 _indexUnique.TryRemove(idxName, out _);
             }
-
-            // 4) (opcjonalnie) flush WAL; w naszym modelu to wystarczy
         }
         finally
         {
@@ -887,7 +903,6 @@ public sealed class WalnutDatabase : IDatabase
 
         await Wal.FlushAsync(ct).ConfigureAwait(false);
 
-        // lokalne pomocnicze
         static void TryDeleteFile(string path)
         {
             try { if (File.Exists(path)) File.Delete(path); } catch { /* best-effort */ }
