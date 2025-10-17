@@ -337,24 +337,58 @@ public sealed class WalnutDatabase : IDatabase
 
         if (_sst.TryGetValue(baseTable, out var sst))
         {
-            try
+            bool sawSharingViolation = false;
+            for (int attempt = 0; attempt < 5; attempt++)
             {
-                if (sst.TryGet(primaryKey, out var _))
-                    return true;
+                try
+                {
+                    if (sst.TryGet(primaryKey, out var _))
+                        return true;
+
+                    break;
+                }
+                catch (FileNotFoundException)
+                {
+                    if (_sst.TryRemove(baseTable, out var missing))
+                        missing.Dispose();
+
+                    break;
+                }
+                catch (DirectoryNotFoundException)
+                {
+                    if (_sst.TryRemove(baseTable, out var missing))
+                        missing.Dispose();
+
+                    break;
+                }
+                catch (IOException ex) when (IsSharingViolation(ex))
+                {
+                    sawSharingViolation = true;
+                    Thread.Sleep(5);
+                    continue;
+                }
+                catch (IOException)
+                {
+                    if (_sst.TryRemove(baseTable, out var missing))
+                        missing.Dispose();
+
+                    break;
+                }
             }
-            catch (FileNotFoundException)
-            {
-                if (_sst.TryRemove(baseTable, out var missing))
-                    missing.Dispose();
-            }
-            catch (DirectoryNotFoundException)
-            {
-                if (_sst.TryRemove(baseTable, out var missing))
-                    missing.Dispose();
-            }
+
+            if (sawSharingViolation)
+                return true; // conservatively assume the owner still exists
         }
 
         return false;
+    }
+
+    private static bool IsSharingViolation(IOException ex)
+    {
+        const int ERROR_SHARING_VIOLATION = 32;
+        const int ERROR_LOCK_VIOLATION = 33;
+        int code = ex.HResult & 0xFFFF;
+        return code == ERROR_SHARING_VIOLATION || code == ERROR_LOCK_VIOLATION;
     }
 
     private static string? TryExtractBaseTableName(string indexTableName)
