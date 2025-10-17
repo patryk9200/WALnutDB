@@ -58,6 +58,21 @@ internal static class WalCodec
         return buf;
     }
 
+    // DROP:   [Op(1)] [TxId(8)] [TableLen(2)] [Table UTF8]
+    public static ReadOnlyMemory<byte> BuildDropTable(ulong txId, string table)
+    {
+        var nameBytes = Encoding.UTF8.GetBytes(table);
+        ushort tlen = checked((ushort)nameBytes.Length);
+
+        var buf = new byte[1 + 8 + 2 + tlen];
+        var span = buf.AsSpan();
+        span[0] = (byte)WalOp.DropTable;
+        BinaryPrimitives.WriteUInt64LittleEndian(span.Slice(1, 8), txId);
+        BinaryPrimitives.WriteUInt16LittleEndian(span.Slice(9, 2), tlen);
+        nameBytes.CopyTo(span.Slice(11, tlen));
+        return buf;
+    }
+
     // COMMIT: [Op(1)] [TxId(8)] [OpsCount(4)]
     public static ReadOnlyMemory<byte> BuildCommit(ulong txId, int opsCount)
     {
