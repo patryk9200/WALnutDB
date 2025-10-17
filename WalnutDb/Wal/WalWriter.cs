@@ -37,7 +37,7 @@ public sealed class WalWriter : IWalWriter
         {
             Mode = FileMode.OpenOrCreate,
             Access = FileAccess.ReadWrite,
-            Share = FileShare.Read, // odczyt recovery równolegle OK
+            Share = FileShare.ReadWrite, // pozwól recovery otworzyć uchwyt RW (truncate)
             Options = FileOptions.Asynchronous | FileOptions.SequentialScan | FileOptions.WriteThrough
         });
         _fs.Seek(0, SeekOrigin.End);

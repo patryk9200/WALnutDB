@@ -19,8 +19,8 @@ internal static class WalRecovery
         using var fs = new FileStream(walPath, new FileStreamOptions
         {
             Mode = FileMode.Open,
-            Access = FileAccess.Read,
-            Share = FileShare.ReadWrite,          // pozwól współistnieć uchwytowi z zapisem
+            Access = FileAccess.ReadWrite,
+            Share = FileShare.ReadWrite,          // współdziel z WalWriterem i pozwól na przycięcie
             Options = FileOptions.SequentialScan
         });
 
@@ -32,23 +32,25 @@ internal static class WalRecovery
 
         // TxId -> lista operacji do zastosowania przy commit
         var pending = new Dictionary<ulong, List<Action>>();
+        long lastGoodPosition = 0;
+        bool truncateTail = false;
 
         while (fs.Position + 8 <= fs.Length) // min: len(4)+crc(4)
         {
             // len
-            if (!TryReadExactly(fs, lenBuf)) break;
+            if (!TryReadExactly(fs, lenBuf)) { truncateTail = true; break; }
             uint len = BinaryPrimitives.ReadUInt32LittleEndian(lenBuf);
-            if (len > fs.Length - fs.Position - 4) break; // niepełna ramka → przerwij
+            if (len > fs.Length - fs.Position - 4) { truncateTail = true; break; } // niepełna ramka → przerwij
 
             // payload
             var payload = new byte[len];
-            if (!TryReadExactly(fs, payload)) break;
+            if (!TryReadExactly(fs, payload)) { truncateTail = true; break; }
 
             // crc
-            if (!TryReadExactly(fs, crcBuf)) break;
+            if (!TryReadExactly(fs, crcBuf)) { truncateTail = true; break; }
             uint fileCrc = BinaryPrimitives.ReadUInt32LittleEndian(crcBuf);
             uint calcCrc = crc.Compute(payload);
-            if (fileCrc != calcCrc) break; // uszkodzona ramka → przerwij
+            if (fileCrc != calcCrc) { truncateTail = true; break; } // uszkodzona ramka → przerwij
 
             // parse payload
             var span = payload.AsSpan();
@@ -130,12 +132,33 @@ internal static class WalRecovery
                     }
                 default:
                     // nieznana ramka → bezpiecznie zatrzymać się
+                    truncateTail = true;
                     fs.Position = fs.Length;
                     break;
             }
+
+            if (truncateTail)
+            {
+                break;
+            }
+
+            lastGoodPosition = fs.Position;
         }
 
         // Transakcje bez COMMIT pozostają w pending i są ignorowane — to OK.
+
+        if (truncateTail)
+        {
+            try
+            {
+                fs.SetLength(lastGoodPosition);
+                fs.Flush(true);
+            }
+            catch (Exception ex)
+            {
+                WalnutLogger.Exception(ex);
+            }
+        }
     }
 
     private static bool TryReadExactly(Stream s, Span<byte> dst)
