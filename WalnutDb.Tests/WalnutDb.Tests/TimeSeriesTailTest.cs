@@ -1,4 +1,5 @@
 ﻿#nullable enable
+using System.Buffers.Binary;
 using WalnutDb.Core;
 using WalnutDb.Wal;
 
