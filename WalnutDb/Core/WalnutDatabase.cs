@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -334,8 +335,24 @@ public sealed class WalnutDatabase : IDatabase
                 return false;
         }
 
-        if (_sst.TryGetValue(baseTable, out var sst) && sst.TryGet(primaryKey, out var _))
-            return true;
+        if (_sst.TryGetValue(baseTable, out var sst))
+        {
+            try
+            {
+                if (sst.TryGet(primaryKey, out var _))
+                    return true;
+            }
+            catch (FileNotFoundException)
+            {
+                if (_sst.TryRemove(baseTable, out var missing))
+                    missing.Dispose();
+            }
+            catch (DirectoryNotFoundException)
+            {
+                if (_sst.TryRemove(baseTable, out var missing))
+                    missing.Dispose();
+            }
+        }
 
         return false;
     }
@@ -396,13 +413,13 @@ public sealed class WalnutDatabase : IDatabase
                 var seq = (ulong)Interlocked.Increment(ref _nextSeqNo);
                 var frames = new List<ReadOnlyMemory<byte>>(take + 2)
                 {
-                    Wal.WalCodec.BuildBegin(txId, seq)
+                    WalCodec.BuildBegin(txId, seq)
                 };
 
                 for (int i = 0; i < take; i++)
-                    frames.Add(Wal.WalCodec.BuildDelete(txId, indexName, keys[offset + i]));
+                    frames.Add(WalCodec.BuildDelete(txId, indexName, keys[offset + i]));
 
-                frames.Add(Wal.WalCodec.BuildCommit(txId, take));
+                frames.Add(WalCodec.BuildCommit(txId, take));
 
                 var handle = Wal.AppendTransactionAsync(frames, Durability.Safe).GetAwaiter().GetResult();
                 handle.WhenCommitted.GetAwaiter().GetResult();
@@ -1102,9 +1119,9 @@ public sealed class WalnutDatabase : IDatabase
 
         var frames = new List<ReadOnlyMemory<byte>>(capacity: 3)
         {
-            Wal.WalCodec.BuildBegin(txId, seq),
-            Wal.WalCodec.BuildDropTable(txId, name),
-            Wal.WalCodec.BuildCommit(txId, 1)
+            WalCodec.BuildBegin(txId, seq),
+            WalCodec.BuildDropTable(txId, name),
+            WalCodec.BuildCommit(txId, 1)
         };
 
         var handle = await Wal.AppendTransactionAsync(frames, Durability.Safe, ct).ConfigureAwait(false);
