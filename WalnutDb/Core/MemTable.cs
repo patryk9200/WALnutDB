@@ -29,21 +29,51 @@ internal sealed class MemTable
             value = null;
             return false;
         }
-        finally { _rw.ExitReadLock(); }
+        catch (Exception ex)
+        {
+            WalnutLogger.Exception(ex);
+            throw;
+        }
+        finally
+        {
+            _rw.ExitReadLock();
+        }
     }
 
     public void Upsert(byte[] key, byte[] value)
     {
         _rw.EnterWriteLock();
-        try { _map[key] = new Entry(value, tombstone: false); }
-        finally { _rw.ExitWriteLock(); }
+        try
+        {
+            _map[key] = new Entry(value, tombstone: false);
+        }
+        catch (Exception ex)
+        {
+            WalnutLogger.Exception(ex);
+            throw;
+        }
+        finally
+        {
+            _rw.ExitWriteLock();
+        }
     }
 
     public void Delete(byte[] key)
     {
         _rw.EnterWriteLock();
-        try { _map[key] = new Entry(value: null, tombstone: true); }
-        finally { _rw.ExitWriteLock(); }
+        try
+        {
+            _map[key] = new Entry(value: null, tombstone: true);
+        }
+        catch (Exception ex)
+        {
+            WalnutLogger.Exception(ex);
+            throw;
+        }
+        finally
+        {
+            _rw.ExitWriteLock();
+        }
     }
 
     public IEnumerable<(byte[] Key, Entry Value)> SnapshotAll(byte[]? afterKeyExclusive)
@@ -56,11 +86,21 @@ internal sealed class MemTable
             int i = 0;
             foreach (var kv in _map) snap[i++] = (kv.Key, kv.Value);
         }
-        finally { _rw.ExitReadLock(); }
+        catch (Exception ex)
+        {
+            WalnutLogger.Exception(ex);
+            throw;
+        }
+        finally
+        {
+            _rw.ExitReadLock();
+        }
 
         if (afterKeyExclusive is null || afterKeyExclusive.Length == 0)
         {
-            for (int i = 0; i < snap.Length; i++) yield return snap[i];
+            for (int i = 0; i < snap.Length; i++)
+                yield return snap[i];
+
             yield break;
         }
         for (int i = 0; i < snap.Length; i++)
@@ -76,18 +116,32 @@ internal sealed class MemTable
         {
             snap = new (byte[] Key, Entry Value)[_map.Count];
             int i = 0;
-            foreach (var kv in _map) snap[i++] = (kv.Key, kv.Value);
+
+            foreach (var kv in _map)
+                snap[i++] = (kv.Key, kv.Value);
         }
-        finally { _rw.ExitReadLock(); }
+        catch (Exception ex)
+        {
+            WalnutLogger.Exception(ex);
+            throw;
+        }
+        finally
+        {
+            _rw.ExitReadLock();
+        }
 
         for (int i = 0; i < snap.Length; i++)
         {
             var (k, v) = snap[i];
 
-            if (fromInclusive.Length != 0 && ByteCompare(k, fromInclusive) < 0) continue;
-            if (toExclusive.Length != 0 && ByteCompare(k, toExclusive) >= 0) break;
-            if (afterKeyExclusive is not null && afterKeyExclusive.Length != 0 &&
-                ByteCompare(k, afterKeyExclusive) <= 0) continue;
+            if (fromInclusive.Length != 0 && ByteCompare(k, fromInclusive) < 0)
+                continue;
+
+            if (toExclusive.Length != 0 && ByteCompare(k, toExclusive) >= 0)
+                break;
+
+            if (afterKeyExclusive is not null && afterKeyExclusive.Length != 0 && ByteCompare(k, afterKeyExclusive) <= 0)
+                continue;
 
             yield return (k, v);
         }
@@ -100,13 +154,27 @@ internal sealed class MemTable
         {
             return _map.TryGetValue(key, out var e) && e.Tombstone;
         }
-        finally { _rw.ExitReadLock(); }
+        catch (Exception ex)
+        {
+            WalnutLogger.Exception(ex);
+            throw;
+        }
+        finally
+        {
+            _rw.ExitReadLock();
+        }
     }
 
     private static int ByteCompare(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b)
     {
         int n = Math.Min(a.Length, b.Length);
-        for (int i = 0; i < n; i++) { int d = a[i] - b[i]; if (d != 0) return d; }
+        for (int i = 0; i < n; i++)
+        {
+            int d = a[i] - b[i];
+
+            if (d != 0)
+                return d;
+        }
         return a.Length - b.Length;
     }
 }

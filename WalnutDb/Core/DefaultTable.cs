@@ -101,9 +101,15 @@ internal sealed class DefaultTable<T> : ITable<T>
 
         var key = _map.GetKeyBytes(item);
 
-        if (HasMemTombstone(_memRef.Current, key)) return true;
-        if (_memRef.Current.TryGet(key, out var _)) return false;
-        if (_db.TryGetFromSst(_name, key, out var fromSst) && fromSst is not null) return false;
+        if (HasMemTombstone(_memRef.Current, key))
+            return true;
+
+        if (_memRef.Current.TryGet(key, out var _))
+            return false;
+
+        if (_db.TryGetFromSst(_name, key, out var fromSst) && fromSst is not null)
+            return false;
+
         return true;
     }
 
@@ -132,6 +138,7 @@ internal sealed class DefaultTable<T> : ITable<T>
         // 1) Odczytaj „stary” rekord: najpierw MEM, a jeśli go nie ma — SST (z decryptem).
         bool hasOld = false;
         T old = default!;
+
         if (_memRef.Current.TryGet(key, out var rawOld) && rawOld is not null)
         {
             old = _map.Deserialize(rawOld);
@@ -164,14 +171,20 @@ internal sealed class DefaultTable<T> : ITable<T>
                 // 1) Rezerwacja (jak masz) — z backoffem
                 var sw = System.Diagnostics.Stopwatch.StartNew();
                 var spin = new System.Threading.SpinWait();
+
                 while (!_db.TryReserveUnique(idx.IndexTableName, newPrefix, key))
                 {
                     ct.ThrowIfCancellationRequested();
+
                     if (sw.Elapsed > TimeSpan.FromMilliseconds(300))
                         throw new InvalidOperationException($"Unique index '{idx.Name}' violation for value '{newValObj}'.");
+
                     spin.SpinOnce();
-                    if (spin.NextSpinWillYield) await Task.Delay(1, ct).ConfigureAwait(false);
+
+                    if (spin.NextSpinWillYield)
+                        await Task.Delay(1, ct).ConfigureAwait(false);
                 }
+
                 reservedNow.Add((idx.IndexTableName, newPrefix));
 
                 // rollback safety
@@ -181,30 +194,42 @@ internal sealed class DefaultTable<T> : ITable<T>
 
                 // 2) (Opcjonalnie) sprawdź, czy mamy już dokładnie (prefix|pk)
                 bool haveExact = false;
+
                 foreach (var kv in idx.Mem.Current.SnapshotRange(newIdxKey, ExactUpperBound(newIdxKey), afterKeyExclusive: null))
                 {
-                    if (!kv.Value.Tombstone) haveExact = true;
+                    if (!kv.Value.Tombstone)
+                        haveExact = true;
+
                     break;
                 }
                 if (!haveExact)
                 {
                     foreach (var _ in _db.ScanSstRange(idx.IndexTableName, newIdxKey, ExactUpperBound(newIdxKey)))
-                    { haveExact = true; break; }
+                    {
+                        haveExact = true;
+                        break;
+                    }
                 }
 
                 // 3) ZAWSZE sprawdź, czy ktoś inny nie ma tego samego prefixu
                 foreach (var kv in idx.Mem.Current.SnapshotRange(newPrefix, to, afterKeyExclusive: null))
                 {
-                    if (kv.Value.Tombstone) continue;
+                    if (kv.Value.Tombstone)
+                        continue;
+
                     var existingPk = IndexKeyCodec.ExtractPrimaryKey(kv.Key);
+
                     if (!ByteArrayEquals(existingPk, key))
                         throw new InvalidOperationException($"Unique index '{idx.Name}' violation for value '{newValObj}'.");
                 }
 
                 foreach (var kv in _db.ScanSstRange(idx.IndexTableName, newPrefix, to))
                 {
-                    if (HasMemTombstone(idx.Mem.Current, kv.Key)) continue;
+                    if (HasMemTombstone(idx.Mem.Current, kv.Key))
+                        continue;
+
                     var existingPk = IndexKeyCodec.ExtractPrimaryKey(kv.Key);
+
                     if (!ByteArrayEquals(existingPk, key))
                         throw new InvalidOperationException($"Unique index '{idx.Name}' violation for value '{newValObj}'.");
                 }
@@ -212,10 +237,13 @@ internal sealed class DefaultTable<T> : ITable<T>
                 // (koniec pętli indeksów)
             }
         }
-        catch
+        catch (Exception ex)
         {
+            WalnutLogger.Exception(ex);
+
             foreach (var (idxTable, prefix) in reservedNow)
                 _db.ReleaseUnique(idxTable, prefix, key); // rollback rezerwacji tej operacji
+
             throw;
         }
 
@@ -272,8 +300,10 @@ internal sealed class DefaultTable<T> : ITable<T>
                 // z MEM
                 foreach (var kv in idx.Mem.Current.SnapshotRange(newPrefix, to, afterKeyExclusive: null))
                 {
-                    if (kv.Value.Tombstone) continue;
+                    if (kv.Value.Tombstone)
+                        continue;
                     var existingPk = IndexKeyCodec.ExtractPrimaryKey(kv.Key);
+
                     if (!ByteArrayEquals(existingPk, key))
                     {
                         var dupKey = kv.Key;
@@ -285,8 +315,11 @@ internal sealed class DefaultTable<T> : ITable<T>
                 // z SST (uszanuj tombstony w MEM)
                 foreach (var kv in _db.ScanSstRange(idx.IndexTableName, newPrefix, to))
                 {
-                    if (HasMemTombstone(idx.Mem.Current, kv.Key)) continue;
+                    if (HasMemTombstone(idx.Mem.Current, kv.Key))
+                        continue;
+
                     var existingPk = IndexKeyCodec.ExtractPrimaryKey(kv.Key);
+
                     if (!ByteArrayEquals(existingPk, key))
                     {
                         var dupKey = kv.Key;
@@ -337,7 +370,9 @@ internal sealed class DefaultTable<T> : ITable<T>
             foreach (var idx in _indexes)
             {
                 var oldValObj = idx.Extract(old);
-                if (oldValObj is null) continue;
+
+                if (oldValObj is null)
+                    continue;
 
                 var oldPrefix = IndexKeyCodec.Encode(oldValObj, idx.DecimalScale);
                 var oldIdxKey = IndexKeyCodec.ComposeIndexEntryKey(oldPrefix, key);
@@ -399,7 +434,9 @@ internal sealed class DefaultTable<T> : ITable<T>
             foreach (var idx in _indexes)
             {
                 var oldValObj = idx.Extract(old);
-                if (oldValObj is null) continue;
+
+                if (oldValObj is null)
+                    continue;
 
                 var oldPrefix = IndexKeyCodec.Encode(oldValObj, idx.DecimalScale);
                 var oldIdxKey = IndexKeyCodec.ComposeIndexEntryKey(oldPrefix, key);
@@ -461,6 +498,7 @@ internal sealed class DefaultTable<T> : ITable<T>
     public async ValueTask<T?> GetFirstAsync(Func<T, bool> predicate, IndexHint hint, CancellationToken ct = default)
     {
         var idx = _indexes.Find(i => string.Equals(i.Name, hint.IndexName, StringComparison.Ordinal));
+
         if (idx is null)
             return await GetFirstAsync(predicate, ct).ConfigureAwait(false);
 
@@ -479,6 +517,7 @@ internal sealed class DefaultTable<T> : ITable<T>
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
         var empty = ReadOnlyMemory<byte>.Empty;
+
         await foreach (var item in ScanByKeyAsync(empty, empty, pageSize, token, ct))
             yield return item;
     }
@@ -551,6 +590,7 @@ internal sealed class DefaultTable<T> : ITable<T>
     [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
         var idx = _indexes.Find(i => string.Equals(i.Name, hint.IndexName, StringComparison.Ordinal));
+
         if (idx is null)
             throw new ArgumentException($"Index '{hint.IndexName}' not found on table '{_name}'.", nameof(hint));
 
@@ -571,14 +611,21 @@ internal sealed class DefaultTable<T> : ITable<T>
         bool MatchesCurrentIndexValue(byte[] indexEntryKey, T obj)
         {
             var curValObj = idx.Extract(obj);
-            if (curValObj is null) return false; // obiekt nie ma już wartości dla tego indeksu → wpis jest nieaktualny
+
+            if (curValObj is null)
+                return false; // obiekt nie ma już wartości dla tego indeksu → wpis jest nieaktualny
 
             var curPrefix = IndexKeyCodec.Encode(curValObj, idx.DecimalScale);
-            if (curPrefix.Length == 0) return false; // nasze indeksy nie trzymają null/empty; potraktuj jako brak
+            if (curPrefix.Length == 0)
+                return false; // nasze indeksy nie trzymają null/empty; potraktuj jako brak
 
             var upper = IndexKeyCodec.PrefixUpperBound(curPrefix); // może być [] = +∞
-            if (ByteCompare(indexEntryKey, curPrefix) < 0) return false;
-            if (upper.Length != 0 && ByteCompare(indexEntryKey, upper) >= 0) return false;
+            if (ByteCompare(indexEntryKey, curPrefix) < 0)
+                return false;
+
+            if (upper.Length != 0 && ByteCompare(indexEntryKey, upper) >= 0)
+                return false;
+
             return true;
         }
 
@@ -600,20 +647,31 @@ internal sealed class DefaultTable<T> : ITable<T>
                     {
                         var pk = IndexKeyCodec.ExtractPrimaryKey(rec.Key);
                         var obj = await GetAsync((object)pk, ct).ConfigureAwait(false);
+
                         if (obj is not null && MatchesCurrentIndexValue(rec.Key, obj))
                         {
-                            if (hint.Skip > 0 && skipped < hint.Skip) { skipped++; }
+                            if (hint.Skip > 0 && skipped < hint.Skip)
+                            {
+                                skipped++;
+                            }
                             else
                             {
                                 yield return obj;
                                 yielded++;
-                                if (++sent >= pageSize) { sent = 0; await Task.Yield(); }
-                                if (limit is int l && yielded >= l) yield break;
+
+                                if (++sent >= pageSize)
+                                {
+                                    sent = 0;
+                                    await Task.Yield();
+                                }
+                                if (limit is int l && yielded >= l)
+                                    yield break;
                             }
                         }
                     }
 
                     lastKey = rec.Key;
+
                     if (hasSst && lastKey is not null && ByteCompare(lastKey, sstEnum.Current.Key) == 0)
                         hasSst = sstEnum.MoveNext();
                 }
@@ -621,11 +679,15 @@ internal sealed class DefaultTable<T> : ITable<T>
                 {
                     var rec = sstEnum.Current; hasSst = sstEnum.MoveNext();
 
-                    if (HasMemTombstone(idx.Mem.Current, rec.Key)) continue;
-                    if (after is not null && ByteCompare(rec.Key, after) <= 0) continue;
+                    if (HasMemTombstone(idx.Mem.Current, rec.Key))
+                        continue;
+
+                    if (after is not null && ByteCompare(rec.Key, after) <= 0)
+                        continue;
 
                     var pk = IndexKeyCodec.ExtractPrimaryKey(rec.Key);
                     var obj = await GetAsync((object)pk, ct).ConfigureAwait(false);
+
                     if (obj is not null && MatchesCurrentIndexValue(rec.Key, obj))
                     {
                         if (hint.Skip > 0 && skipped < hint.Skip) { skipped++; }
@@ -633,8 +695,14 @@ internal sealed class DefaultTable<T> : ITable<T>
                         {
                             yield return obj;
                             yielded++;
-                            if (++sent >= pageSize) { sent = 0; await Task.Yield(); }
-                            if (limit is int l && yielded >= l) yield break;
+
+                            if (++sent >= pageSize)
+                            {
+                                sent = 0;
+                                await Task.Yield();
+                            }
+                            if (limit is int l && yielded >= l)
+                                yield break;
                         }
                     }
                 }
@@ -659,14 +727,18 @@ internal sealed class DefaultTable<T> : ITable<T>
                 {
                     var pk = IndexKeyCodec.ExtractPrimaryKey(rec.Key);
                     var obj = await GetAsync((object)pk, ct).ConfigureAwait(false);
+
                     if (obj is not null && MatchesCurrentIndexValue(rec.Key, obj))
                     {
                         ring.AddLast(obj);
-                        if (ring.Count > cap) ring.RemoveFirst();
+
+                        if (ring.Count > cap)
+                            ring.RemoveFirst();
                     }
                 }
 
                 lastKey = rec.Key;
+
                 if (hasSst && lastKey is not null && ByteCompare(lastKey, sstEnum.Current.Key) == 0)
                     hasSst = sstEnum.MoveNext();
             }
@@ -674,15 +746,21 @@ internal sealed class DefaultTable<T> : ITable<T>
             {
                 var rec = sstEnum.Current; hasSst = sstEnum.MoveNext();
 
-                if (HasMemTombstone(idx.Mem.Current, rec.Key)) continue;
-                if (after is not null && ByteCompare(rec.Key, after) <= 0) continue;
+                if (HasMemTombstone(idx.Mem.Current, rec.Key))
+                    continue;
+
+                if (after is not null && ByteCompare(rec.Key, after) <= 0)
+                    continue;
 
                 var pk = IndexKeyCodec.ExtractPrimaryKey(rec.Key);
                 var obj = await GetAsync((object)pk, ct).ConfigureAwait(false);
+
                 if (obj is not null && MatchesCurrentIndexValue(rec.Key, obj))
                 {
                     ring.AddLast(obj);
-                    if (ring.Count > cap) ring.RemoveFirst();
+
+                    if (ring.Count > cap)
+                        ring.RemoveFirst();
                 }
             }
         }
@@ -695,7 +773,12 @@ internal sealed class DefaultTable<T> : ITable<T>
         {
             yield return arr[i];
             remaining--;
-            if (++sent >= pageSize) { sent = 0; await Task.Yield(); }
+
+            if (++sent >= pageSize)
+            {
+                sent = 0;
+                await Task.Yield();
+            }
         }
     }
 
@@ -708,6 +791,7 @@ internal sealed class DefaultTable<T> : ITable<T>
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
         var hint = new IndexHint(indexName, start, end, Asc: true, Skip: 0, Take: null);
+
         await foreach (var x in ScanByIndexAsync(hint, pageSize, token, ct))
             yield return x;
     }
@@ -741,6 +825,7 @@ internal sealed class DefaultTable<T> : ITable<T>
         {
             await foreach (var it in QueryAsync(predicate, pageSize, token, ct))
                 yield return it;
+
             yield break;
         }
 
@@ -751,12 +836,20 @@ internal sealed class DefaultTable<T> : ITable<T>
 
         await foreach (var item in ScanByIndexAsync(scanHint, pageSize, token, ct))
         {
-            if (!predicate(item)) continue;
-            if (hint.Skip > 0 && skipped < hint.Skip) { skipped++; continue; }
+            if (!predicate(item))
+                continue;
+
+            if (hint.Skip > 0 && skipped < hint.Skip)
+            {
+                skipped++;
+                continue;
+            }
 
             yield return item;
             yielded++;
-            if (limit is int l && yielded >= l) yield break;
+
+            if (limit is int l && yielded >= l)
+                yield break;
         }
     }
 
@@ -802,19 +895,26 @@ internal sealed class DefaultTable<T> : ITable<T>
 
     private static bool ByteArrayEquals(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b)
     {
-        if (a.Length != b.Length) return false;
+        if (a.Length != b.Length)
+            return false;
+
         for (int i = 0; i < a.Length; i++)
-            if (a[i] != b[i]) return false;
+            if (a[i] != b[i])
+                return false;
+
         return true;
     }
 
     private static int ByteCompare(byte[] a, byte[] b)
     {
         int min = Math.Min(a.Length, b.Length);
+
         for (int i = 0; i < min; i++)
         {
             int d = a[i] - b[i];
-            if (d != 0) return d;
+
+            if (d != 0)
+                return d;
         }
         return a.Length - b.Length;
     }

@@ -59,8 +59,9 @@ namespace WalnutDb.Sst
                 var idxPath = path + ".sxi";
                 await SstIndex.WriteAsync(idxPath, idx, ct).ConfigureAwait(false);
             }
-            catch
+            catch (Exception ex)
             {
+                WalnutLogger.Exception(ex);
                 // indeks jest opcjonalny; w razie błędu po prostu go pomijamy
             }
         }

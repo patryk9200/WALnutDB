@@ -58,6 +58,11 @@ public sealed class WalWriter : IWalWriter
 
             await _fs.FlushAsync(ct).ConfigureAwait(false);
         }
+        catch (Exception ex)
+        {
+            WalnutLogger.Exception(ex);
+            throw new IOException("WalWriter.TruncateAsync failed", ex);
+        }
         finally
         {
             _ioGate.Release();
@@ -66,11 +71,15 @@ public sealed class WalWriter : IWalWriter
 
     public async ValueTask<CommitHandle> AppendTransactionAsync(IReadOnlyList<ReadOnlyMemory<byte>> frames, Durability durability, CancellationToken ct = default)
     {
-        if (frames.Count == 0) throw new ArgumentException("empty frames");
+        if (frames.Count == 0) 
+            throw new ArgumentException("empty frames");
+
         var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         var item = new WalItem(frames, durability, tcs);
+
         if (!_queue.Writer.TryWrite(item))
             await _queue.Writer.WriteAsync(item, ct).ConfigureAwait(false);
+
         return new CommitHandle(tcs.Task);
     }
 
@@ -102,6 +111,8 @@ public sealed class WalWriter : IWalWriter
         catch (OperationCanceledException) { /* normal shutdown */ }
         catch (Exception ex)
         {
+            WalnutLogger.Exception(ex);
+
             foreach (var item in pending)
                 item.Promise.TrySetException(ex);
 
@@ -111,7 +122,11 @@ public sealed class WalWriter : IWalWriter
                 while (reader.TryRead(out var item))
                     item.Promise.TrySetException(ex);
             }
-            catch { /* ignore */ }
+            catch (Exception e)
+            {
+                WalnutLogger.Exception(e);
+                /* ignore */
+            }
         }
     }
 

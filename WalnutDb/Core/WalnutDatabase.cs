@@ -55,8 +55,9 @@ public sealed class WalnutDatabase : IDatabase
                 WalRecovery.Replay(walPath, recovered, _options.Encryption);
                 AdoptRecoveredTables(recovered);
             }
-            catch
+            catch (Exception ex)
             {
+                WalnutLogger.Exception(ex);
             }
         }
 
@@ -70,7 +71,15 @@ public sealed class WalnutDatabase : IDatabase
             var baseName = Path.GetFileNameWithoutExtension(file);
             var logicalName = DecodeNameFromFile(baseName);
             var canonical = CanonicalizeName(logicalName);
-            try { _sst[canonical] = new SstReader(file); } catch { /* ignore */ }
+            try
+            {
+                _sst[canonical] = new SstReader(file);
+            }
+            catch (Exception ex)
+            {
+                WalnutLogger.Exception(ex);
+                /* ignore */
+            }
         }
 
         try
@@ -109,7 +118,11 @@ public sealed class WalnutDatabase : IDatabase
             foreach (var n in _tables.Keys.Except(_sst.Keys))
                 Console.WriteLine($"[Mem only] {n}");
         }
-        catch { /* seed jest best-effort */ }
+        catch (Exception ex)
+        {
+            WalnutLogger.Exception(ex);
+            /* seed jest best-effort */
+        }
     }
 
     private void AdoptRecoveredTables(ConcurrentDictionary<string, MemTable> recovered)
@@ -200,7 +213,11 @@ public sealed class WalnutDatabase : IDatabase
                 if (File.Exists(dst))
                 {
                     // Preferujemy docelowy – źródłowy sprzątamy (best-effort).
-                    try { File.Delete(src); } catch { }
+                    try
+                    {
+                        File.Delete(src);
+                    }
+                    catch { }
                 }
                 else
                 {
@@ -252,8 +269,12 @@ public sealed class WalnutDatabase : IDatabase
 
     private static bool ByteArrayEquals(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b)
     {
-        if (a.Length != b.Length) return false;
-        for (int i = 0; i < a.Length; i++) if (a[i] != b[i]) return false;
+        if (a.Length != b.Length)
+            return false;
+
+        for (int i = 0; i < a.Length; i++) if (a[i] != b[i])
+                return false;
+
         return true;
     }
 
@@ -344,6 +365,7 @@ public sealed class WalnutDatabase : IDatabase
             {
                 if (_sst.TryGetValue(name, out var sst))
                     return sst.TryGet(key, out value);
+
                 return false;
             }
             catch (IOException)
@@ -424,8 +446,11 @@ public sealed class WalnutDatabase : IDatabase
 
     private static string CanonicalizeName(string raw)
     {
-        if (string.IsNullOrWhiteSpace(raw)) return "_";
+        if (string.IsNullOrWhiteSpace(raw)) 
+            return "_";
+
         var sb = new StringBuilder(raw.Length);
+
         foreach (var ch in raw)
         {
             if (char.IsLetterOrDigit(ch) || ch == '_' || ch == '-' || ch == '.')
@@ -434,8 +459,13 @@ public sealed class WalnutDatabase : IDatabase
                 sb.Append('_'); // zamień znaki niedozwolone w nazwach plików Windows/Unix
         }
         var s = sb.ToString().Trim().TrimEnd('.', ' ');
-        if (s.Length == 0) s = "_";
-        if (s.Length > 180) s = s.Substring(0, 180);
+
+        if (s.Length == 0) 
+            s = "_";
+
+        if (s.Length > 180) 
+            s = s.Substring(0, 180);
+
         return s;
     }
 
@@ -451,11 +481,21 @@ public sealed class WalnutDatabase : IDatabase
 
     private static bool IsSafeFileName(string name)
     {
-        if (string.IsNullOrWhiteSpace(name)) return false;
-        if (name.IndexOfAny(InvalidFileChars) >= 0) return false;
-        if (name.Length > 120) return false; // margines na rozszerzenia
-        if (name.TrimEnd().EndsWith(".", StringComparison.Ordinal)) return false;
-        if (WindowsReserved.Contains(name)) return false;
+        if (string.IsNullOrWhiteSpace(name))
+            return false;
+
+        if (name.IndexOfAny(InvalidFileChars) >= 0)
+            return false;
+
+        if (name.Length > 120)
+            return false; // margines na rozszerzenia
+
+        if (name.TrimEnd().EndsWith(".", StringComparison.Ordinal))
+            return false;
+
+        if (WindowsReserved.Contains(name))
+            return false;
+
         return true;
     }
 
@@ -504,7 +544,10 @@ public sealed class WalnutDatabase : IDatabase
                           .GetString(bytes);
             return true;
         }
-        catch { return false; }
+        catch
+        {
+            return false;
+        }
     }
 
     private static string ToBase64UrlNoPad(byte[] bytes)
@@ -623,7 +666,11 @@ public sealed class WalnutDatabase : IDatabase
             : Path.Combine(_dir, "wal.log");
 
         long walBytes = 0;
-        try { walBytes = File.Exists(walPath) ? new FileInfo(walPath).Length : 0; } catch { /* best-effort */ }
+        try
+        {
+            walBytes = File.Exists(walPath) ? new FileInfo(walPath).Length : 0;
+        }
+        catch { /* best-effort */ }
 
         var names = new HashSet<string>(_tables.Keys);
         foreach (var n in _sst.Keys) names.Add(n);
@@ -653,7 +700,11 @@ public sealed class WalnutDatabase : IDatabase
             if (_sst.TryGetValue(name, out var sst))
             {
                 sstCount = 1;
-                try { sstSizeBytes = new FileInfo(sst.Path).Length; } catch { /* ignore */ }
+                try
+                {
+                    sstSizeBytes = new FileInfo(sst.Path).Length;
+                }
+                catch { /* ignore */ }
 
                 foreach (var kv in sst.ScanRange(Array.Empty<byte>(), Array.Empty<byte>()))
                     live += kv.Val.LongLength;
@@ -724,7 +775,11 @@ public sealed class WalnutDatabase : IDatabase
         {
             var dst = Path.Combine(targetDir, Path.GetFileName(mf));
             File.Copy(mf, dst, overwrite: true);
-            try { copied += new FileInfo(mf).Length; } catch { /* best-effort */ }
+            try
+            {
+                copied += new FileInfo(mf).Length;
+            }
+            catch { /* best-effort */ }
         }
 
         return new BackupResult(targetDir, copied);
@@ -832,7 +887,11 @@ public sealed class WalnutDatabase : IDatabase
     public async ValueTask DisposeAsync()
     {
         foreach (var s in _sst.Values)
-            try { s.Dispose(); } catch { }
+            try
+            {
+                s.Dispose();
+            }
+            catch { }
         _sst.Clear();
         await Wal.DisposeAsync().ConfigureAwait(false);
 
@@ -865,7 +924,11 @@ public sealed class WalnutDatabase : IDatabase
 
             if (_sst.TryRemove(name, out var sst))
             {
-                try { sst.Dispose(); } catch { /* ignore */ }
+                try
+                {
+                    sst.Dispose();
+                }
+                catch { /* ignore */ }
             }
 
             var safe = EncodeNameToFile(name);
@@ -886,7 +949,11 @@ public sealed class WalnutDatabase : IDatabase
                 _tables.TryRemove(idxName, out _);
 
                 if (_sst.TryRemove(idxName, out var idxSst))
-                    try { idxSst.Dispose(); } catch { }
+                    try
+                    {
+                        idxSst.Dispose();
+                    }
+                    catch { }
 
                 var idxSafe = EncodeNameToFile(idxName);
                 TryDeleteFile(Path.Combine(_sstDir, $"{idxSafe}.sst"));
@@ -905,7 +972,12 @@ public sealed class WalnutDatabase : IDatabase
 
         static void TryDeleteFile(string path)
         {
-            try { if (File.Exists(path)) File.Delete(path); } catch { /* best-effort */ }
+            try
+            {
+                if (File.Exists(path))
+                    File.Delete(path);
+            }
+            catch { /* best-effort */ }
         }
     }
 
@@ -981,7 +1053,11 @@ public sealed class WalnutDatabase : IDatabase
         }
         finally
         {
-            try { File.Delete(testFile); } catch { /* ignore */ }
+            try
+            {
+                File.Delete(testFile);
+            }
+            catch { /* ignore */ }
         }
     }
 

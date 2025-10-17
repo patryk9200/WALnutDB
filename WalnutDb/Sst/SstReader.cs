@@ -20,6 +20,7 @@ namespace WalnutDb.Sst
 
             using var fs = OpenRead();
             var hdr = new byte[Header.Length];
+
             if (fs.Read(hdr, 0, hdr.Length) != hdr.Length || !hdr.AsSpan().SequenceEqual(Header))
                 throw new InvalidDataException("Invalid SST header.");
 
@@ -33,9 +34,11 @@ namespace WalnutDb.Sst
                     _idxOffsets = idx.Value.Offsets;
                 }
             }
-            catch
+            catch (Exception ex)
             {
-                _idxKeys = null; _idxOffsets = null;
+                WalnutLogger.Exception(ex);
+                _idxKeys = null;
+                _idxOffsets = null;
             }
         }
 
@@ -51,11 +54,14 @@ namespace WalnutDb.Sst
 
             while (fs.Position < endPos)
             {
-                if (fs.Read(len, 0, 8) != 8) return false;
+                if (fs.Read(len, 0, 8) != 8) 
+                    return false;
 
                 uint klen = BinaryPrimitives.ReadUInt32LittleEndian(len.AsSpan(0, 4));
                 uint vlen = BinaryPrimitives.ReadUInt32LittleEndian(len.AsSpan(4, 4));
-                if (klen > int.MaxValue || vlen > int.MaxValue) return false;
+
+                if (klen > int.MaxValue || vlen > int.MaxValue) 
+                    return false;
 
                 var kbuf = new byte[(int)klen];
                 var vbuf = new byte[(int)vlen];
@@ -64,8 +70,16 @@ namespace WalnutDb.Sst
                 if (fs.Read(vbuf, 0, vbuf.Length) != vbuf.Length) return false;
 
                 int cmp = ByteCompare(kbuf, key);
-                if (cmp == 0) { value = vbuf; return true; }
-                if (cmp > 0) { return false; } // sortowane
+                if (cmp == 0)
+                {
+                    value = vbuf;
+                    return true;
+                }
+
+                if (cmp > 0)
+                {
+                    return false;
+                } // sortowane
             }
             return false;
         }
@@ -95,17 +109,23 @@ namespace WalnutDb.Sst
 
             while (fs.Position < endPos)
             {
-                if (fs.Read(len, 0, 8) != 8) yield break;
+                if (fs.Read(len, 0, 8) != 8) 
+                    yield break;
 
                 uint klen = BinaryPrimitives.ReadUInt32LittleEndian(len.AsSpan(0, 4));
                 uint vlen = BinaryPrimitives.ReadUInt32LittleEndian(len.AsSpan(4, 4));
-                if (klen > int.MaxValue || vlen > int.MaxValue) yield break;
+
+                if (klen > int.MaxValue || vlen > int.MaxValue) 
+                    yield break;
 
                 var kbuf = new byte[(int)klen];
                 var vbuf = new byte[(int)vlen];
 
-                if (fs.Read(kbuf, 0, kbuf.Length) != kbuf.Length) yield break;
-                if (fs.Read(vbuf, 0, vbuf.Length) != vbuf.Length) yield break;
+                if (fs.Read(kbuf, 0, kbuf.Length) != kbuf.Length) 
+                    yield break;
+
+                if (fs.Read(vbuf, 0, vbuf.Length) != vbuf.Length) 
+                    yield break;
 
                 if (!inRange)
                     inRange = ByteCompare(kbuf, from) >= 0;
