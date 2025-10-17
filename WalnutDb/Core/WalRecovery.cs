@@ -2,6 +2,7 @@
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Text;
+using WalnutDb;
 
 namespace WalnutDb.Core;
 
@@ -35,8 +36,10 @@ internal static class WalRecovery
         long lastGoodPosition = 0;
         bool truncateTail = false;
 
+        string? truncateReason = null;
         while (fs.Position + 8 <= fs.Length) // min: len(4)+crc(4)
         {
+            long frameStart = fs.Position;
             // len
             if (!TryReadExactly(fs, lenBuf)) { truncateTail = true; break; }
             uint len = BinaryPrimitives.ReadUInt32LittleEndian(lenBuf);
@@ -60,7 +63,12 @@ internal static class WalRecovery
             {
                 case Wal.WalOp.Begin:
                     {
-                        if (span.Length < 1 + 8 + 8) break;
+                        if (span.Length < 1 + 8 + 8)
+                        {
+                            truncateReason = $"BEGIN frame too short ({span.Length} bytes) at offset {frameStart}";
+                            truncateTail = true;
+                            break;
+                        }
                         ulong txId = BinaryPrimitives.ReadUInt64LittleEndian(span.Slice(1, 8));
                         if (!pending.ContainsKey(txId))
                             pending[txId] = new List<Action>(8);
@@ -68,13 +76,23 @@ internal static class WalRecovery
                     }
                 case Wal.WalOp.Put:
                     {
-                        if (span.Length < 1 + 8 + 2 + 4 + 4) break;
+                        if (span.Length < 1 + 8 + 2 + 4 + 4)
+                        {
+                            truncateReason = $"PUT frame too short ({span.Length} bytes) at offset {frameStart}";
+                            truncateTail = true;
+                            break;
+                        }
                         ulong txId = BinaryPrimitives.ReadUInt64LittleEndian(span.Slice(1, 8));
                         ushort tlen = BinaryPrimitives.ReadUInt16LittleEndian(span.Slice(9, 2));
                         int klen = BinaryPrimitives.ReadInt32LittleEndian(span.Slice(11, 4));
                         int vlen = BinaryPrimitives.ReadInt32LittleEndian(span.Slice(15, 4));
                         int off = 19;
-                        if (off + tlen + klen + vlen > span.Length) break;
+                        if (off + tlen + klen + vlen > span.Length)
+                        {
+                            truncateReason = $"PUT frame payload truncated at offset {frameStart}";
+                            truncateTail = true;
+                            break;
+                        }
 
                         string table = Encoding.UTF8.GetString(span.Slice(off, tlen));
                         off += tlen;
@@ -96,12 +114,22 @@ internal static class WalRecovery
                     }
                 case Wal.WalOp.Delete:
                     {
-                        if (span.Length < 1 + 8 + 2 + 4) break;
+                        if (span.Length < 1 + 8 + 2 + 4)
+                        {
+                            truncateReason = $"DELETE frame too short ({span.Length} bytes) at offset {frameStart}";
+                            truncateTail = true;
+                            break;
+                        }
                         ulong txId = BinaryPrimitives.ReadUInt64LittleEndian(span.Slice(1, 8));
                         ushort tlen = BinaryPrimitives.ReadUInt16LittleEndian(span.Slice(9, 2));
                         int klen = BinaryPrimitives.ReadInt32LittleEndian(span.Slice(11, 4));
                         int off = 15;
-                        if (off + tlen + klen > span.Length) break;
+                        if (off + tlen + klen > span.Length)
+                        {
+                            truncateReason = $"DELETE frame payload truncated at offset {frameStart}";
+                            truncateTail = true;
+                            break;
+                        }
 
                         string table = Encoding.UTF8.GetString(span.Slice(off, tlen));
                         off += tlen;
@@ -119,7 +147,12 @@ internal static class WalRecovery
                     }
                 case Wal.WalOp.Commit:
                     {
-                        if (span.Length < 1 + 8 + 4) break;
+                        if (span.Length < 1 + 8 + 4)
+                        {
+                            truncateReason = $"COMMIT frame too short ({span.Length} bytes) at offset {frameStart}";
+                            truncateTail = true;
+                            break;
+                        }
                         ulong txId = BinaryPrimitives.ReadUInt64LittleEndian(span.Slice(1, 8));
                         // opsCount = BinaryPrimitives.ReadInt32LittleEndian(span.Slice(9,4)); // nieużywane
 
