@@ -2,6 +2,7 @@
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Text;
+using WalnutDb;
 
 namespace WalnutDb.Core;
 
@@ -19,8 +20,8 @@ internal static class WalRecovery
         using var fs = new FileStream(walPath, new FileStreamOptions
         {
             Mode = FileMode.Open,
-            Access = FileAccess.Read,
-            Share = FileShare.ReadWrite,          // pozwól współistnieć uchwytowi z zapisem
+            Access = FileAccess.ReadWrite,
+            Share = FileShare.ReadWrite,          // współdziel z WalWriterem i pozwól na przycięcie
             Options = FileOptions.SequentialScan
         });
 
@@ -32,23 +33,52 @@ internal static class WalRecovery
 
         // TxId -> lista operacji do zastosowania przy commit
         var pending = new Dictionary<ulong, List<Action>>();
+        long lastGoodPosition = 0;
+        bool truncateTail = false;
 
+        string? truncateReason = null;
         while (fs.Position + 8 <= fs.Length) // min: len(4)+crc(4)
         {
+            long frameStart = fs.Position;
             // len
-            if (!TryReadExactly(fs, lenBuf)) break;
+            if (!TryReadExactly(fs, lenBuf))
+            {
+                truncateReason = $"unexpected EOF while reading frame length at offset {frameStart}";
+                truncateTail = true;
+                break;
+            }
             uint len = BinaryPrimitives.ReadUInt32LittleEndian(lenBuf);
-            if (len > fs.Length - fs.Position - 4) break; // niepełna ramka → przerwij
+            if (len > fs.Length - fs.Position - 4)
+            {
+                truncateReason = $"frame length {len} at offset {frameStart} exceeds remaining file size";
+                truncateTail = true;
+                break; // niepełna ramka → przerwij
+            }
 
             // payload
             var payload = new byte[len];
-            if (!TryReadExactly(fs, payload)) break;
+            if (!TryReadExactly(fs, payload))
+            {
+                truncateReason = $"unexpected EOF while reading payload (len={len}) at offset {frameStart + 4}";
+                truncateTail = true;
+                break;
+            }
 
             // crc
-            if (!TryReadExactly(fs, crcBuf)) break;
+            if (!TryReadExactly(fs, crcBuf))
+            {
+                truncateReason = $"unexpected EOF while reading CRC at offset {frameStart + 4 + len}";
+                truncateTail = true;
+                break;
+            }
             uint fileCrc = BinaryPrimitives.ReadUInt32LittleEndian(crcBuf);
             uint calcCrc = crc.Compute(payload);
-            if (fileCrc != calcCrc) break; // uszkodzona ramka → przerwij
+            if (fileCrc != calcCrc)
+            {
+                truncateReason = $"CRC mismatch at offset {frameStart}: stored=0x{fileCrc:X8}, computed=0x{calcCrc:X8}";
+                truncateTail = true;
+                break; // uszkodzona ramka → przerwij
+            }
 
             // parse payload
             var span = payload.AsSpan();
@@ -58,7 +88,12 @@ internal static class WalRecovery
             {
                 case Wal.WalOp.Begin:
                     {
-                        if (span.Length < 1 + 8 + 8) break;
+                        if (span.Length < 1 + 8 + 8)
+                        {
+                            truncateReason = $"BEGIN frame too short ({span.Length} bytes) at offset {frameStart}";
+                            truncateTail = true;
+                            break;
+                        }
                         ulong txId = BinaryPrimitives.ReadUInt64LittleEndian(span.Slice(1, 8));
                         if (!pending.ContainsKey(txId))
                             pending[txId] = new List<Action>(8);
@@ -66,13 +101,23 @@ internal static class WalRecovery
                     }
                 case Wal.WalOp.Put:
                     {
-                        if (span.Length < 1 + 8 + 2 + 4 + 4) break;
+                        if (span.Length < 1 + 8 + 2 + 4 + 4)
+                        {
+                            truncateReason = $"PUT frame too short ({span.Length} bytes) at offset {frameStart}";
+                            truncateTail = true;
+                            break;
+                        }
                         ulong txId = BinaryPrimitives.ReadUInt64LittleEndian(span.Slice(1, 8));
                         ushort tlen = BinaryPrimitives.ReadUInt16LittleEndian(span.Slice(9, 2));
                         int klen = BinaryPrimitives.ReadInt32LittleEndian(span.Slice(11, 4));
                         int vlen = BinaryPrimitives.ReadInt32LittleEndian(span.Slice(15, 4));
                         int off = 19;
-                        if (off + tlen + klen + vlen > span.Length) break;
+                        if (off + tlen + klen + vlen > span.Length)
+                        {
+                            truncateReason = $"PUT frame payload truncated at offset {frameStart}";
+                            truncateTail = true;
+                            break;
+                        }
 
                         string table = Encoding.UTF8.GetString(span.Slice(off, tlen));
                         off += tlen;
@@ -94,12 +139,22 @@ internal static class WalRecovery
                     }
                 case Wal.WalOp.Delete:
                     {
-                        if (span.Length < 1 + 8 + 2 + 4) break;
+                        if (span.Length < 1 + 8 + 2 + 4)
+                        {
+                            truncateReason = $"DELETE frame too short ({span.Length} bytes) at offset {frameStart}";
+                            truncateTail = true;
+                            break;
+                        }
                         ulong txId = BinaryPrimitives.ReadUInt64LittleEndian(span.Slice(1, 8));
                         ushort tlen = BinaryPrimitives.ReadUInt16LittleEndian(span.Slice(9, 2));
                         int klen = BinaryPrimitives.ReadInt32LittleEndian(span.Slice(11, 4));
                         int off = 15;
-                        if (off + tlen + klen > span.Length) break;
+                        if (off + tlen + klen > span.Length)
+                        {
+                            truncateReason = $"DELETE frame payload truncated at offset {frameStart}";
+                            truncateTail = true;
+                            break;
+                        }
 
                         string table = Encoding.UTF8.GetString(span.Slice(off, tlen));
                         off += tlen;
@@ -117,7 +172,12 @@ internal static class WalRecovery
                     }
                 case Wal.WalOp.Commit:
                     {
-                        if (span.Length < 1 + 8 + 4) break;
+                        if (span.Length < 1 + 8 + 4)
+                        {
+                            truncateReason = $"COMMIT frame too short ({span.Length} bytes) at offset {frameStart}";
+                            truncateTail = true;
+                            break;
+                        }
                         ulong txId = BinaryPrimitives.ReadUInt64LittleEndian(span.Slice(1, 8));
                         // opsCount = BinaryPrimitives.ReadInt32LittleEndian(span.Slice(9,4)); // nieużywane
 
@@ -130,12 +190,36 @@ internal static class WalRecovery
                     }
                 default:
                     // nieznana ramka → bezpiecznie zatrzymać się
+                    truncateReason = $"unknown WAL opcode 0x{op:X2} at offset {frameStart}";
+                    truncateTail = true;
                     fs.Position = fs.Length;
                     break;
             }
+
+            if (truncateTail)
+            {
+                break;
+            }
+
+            lastGoodPosition = fs.Position;
         }
 
         // Transakcje bez COMMIT pozostają w pending i są ignorowane — to OK.
+
+        if (truncateTail)
+        {
+            long before = fs.Length;
+            WalnutLogger.Warning($"Truncating WAL tail: {truncateReason ?? "unknown reason"} (from {before} to {lastGoodPosition} bytes)");
+            try
+            {
+                fs.SetLength(lastGoodPosition);
+                fs.Flush(true);
+            }
+            catch (Exception ex)
+            {
+                WalnutLogger.Exception(ex);
+            }
+        }
     }
 
     private static bool TryReadExactly(Stream s, Span<byte> dst)
