@@ -175,9 +175,9 @@ public sealed class TimeSeriesTailTests
 
         await using (var fs = new FileStream(walPath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite))
         {
-            var lenBuf = new byte[4];
-            BinaryPrimitives.WriteUInt32LittleEndian(lenBuf.AsSpan(), 512u);
-            await fs.WriteAsync(lenBuf, 0, lenBuf.Length);
+            Span<byte> lenBuf = stackalloc byte[4];
+            BinaryPrimitives.WriteUInt32LittleEndian(lenBuf, 512u);
+            await fs.WriteAsync(lenBuf);
             await fs.FlushAsync();
         }
 

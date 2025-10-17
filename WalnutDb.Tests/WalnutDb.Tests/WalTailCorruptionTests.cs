@@ -66,9 +66,9 @@ public sealed class WalTailCorruptionTests
         // Append an incomplete frame (length without payload)
         await using (var fs = new FileStream(walPath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite))
         {
-            var lenBuf = new byte[4];
-            BinaryPrimitives.WriteUInt32LittleEndian(lenBuf.AsSpan(), 1024u);
-            await fs.WriteAsync(lenBuf, 0, lenBuf.Length);
+            Span<byte> lenBuf = stackalloc byte[4];
+            BinaryPrimitives.WriteUInt32LittleEndian(lenBuf, 1024u);
+            await fs.WriteAsync(lenBuf);
             await fs.FlushAsync();
         }
 
@@ -126,12 +126,12 @@ public sealed class WalTailCorruptionTests
         using (var fs = new FileStream(walPath, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite))
         {
             fs.Seek(-4, SeekOrigin.End);
-            var crcBuf = new byte[4];
-            int read = fs.Read(crcBuf, 0, crcBuf.Length);
+            Span<byte> crcBuf = stackalloc byte[4];
+            int read = fs.Read(crcBuf);
             Assert.Equal(4, read);
             crcBuf[0] ^= 0xFF; // flip a few bits to make CRC invalid
             fs.Seek(-4, SeekOrigin.End);
-            fs.Write(crcBuf, 0, crcBuf.Length);
+            fs.Write(crcBuf);
             fs.Flush();
         }
 

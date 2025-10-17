@@ -41,44 +41,19 @@ internal static class WalRecovery
         {
             long frameStart = fs.Position;
             // len
-            if (!TryReadExactly(fs, lenBuf))
-            {
-                truncateReason = $"unexpected EOF while reading frame length at offset {frameStart}";
-                truncateTail = true;
-                break;
-            }
+            if (!TryReadExactly(fs, lenBuf)) { truncateTail = true; break; }
             uint len = BinaryPrimitives.ReadUInt32LittleEndian(lenBuf);
-            if (len > fs.Length - fs.Position - 4)
-            {
-                truncateReason = $"frame length {len} at offset {frameStart} exceeds remaining file size";
-                truncateTail = true;
-                break; // niepełna ramka → przerwij
-            }
+            if (len > fs.Length - fs.Position - 4) { truncateTail = true; break; } // niepełna ramka → przerwij
 
             // payload
             var payload = new byte[len];
-            if (!TryReadExactly(fs, payload))
-            {
-                truncateReason = $"unexpected EOF while reading payload (len={len}) at offset {frameStart + 4}";
-                truncateTail = true;
-                break;
-            }
+            if (!TryReadExactly(fs, payload)) { truncateTail = true; break; }
 
             // crc
-            if (!TryReadExactly(fs, crcBuf))
-            {
-                truncateReason = $"unexpected EOF while reading CRC at offset {frameStart + 4 + len}";
-                truncateTail = true;
-                break;
-            }
+            if (!TryReadExactly(fs, crcBuf)) { truncateTail = true; break; }
             uint fileCrc = BinaryPrimitives.ReadUInt32LittleEndian(crcBuf);
             uint calcCrc = crc.Compute(payload);
-            if (fileCrc != calcCrc)
-            {
-                truncateReason = $"CRC mismatch at offset {frameStart}: stored=0x{fileCrc:X8}, computed=0x{calcCrc:X8}";
-                truncateTail = true;
-                break; // uszkodzona ramka → przerwij
-            }
+            if (fileCrc != calcCrc) { truncateTail = true; break; } // uszkodzona ramka → przerwij
 
             // parse payload
             var span = payload.AsSpan();
@@ -190,7 +165,6 @@ internal static class WalRecovery
                     }
                 default:
                     // nieznana ramka → bezpiecznie zatrzymać się
-                    truncateReason = $"unknown WAL opcode 0x{op:X2} at offset {frameStart}";
                     truncateTail = true;
                     fs.Position = fs.Length;
                     break;
@@ -208,23 +182,14 @@ internal static class WalRecovery
 
         if (truncateTail)
         {
-            long before = fs.Length;
-            if (lastGoodPosition < before)
+            try
             {
-                WalnutLogger.Warning($"Truncating WAL tail: {truncateReason ?? "unknown reason"} (from {before} to {lastGoodPosition} bytes)");
-                try
-                {
-                    fs.SetLength(lastGoodPosition);
-                    fs.Flush(true);
-                }
-                catch (Exception ex)
-                {
-                    WalnutLogger.Exception(ex);
-                }
+                fs.SetLength(lastGoodPosition);
+                fs.Flush(true);
             }
-            else
+            catch (Exception ex)
             {
-                WalnutLogger.Warning($"Detected WAL tail issue but nothing to truncate: {truncateReason ?? "unknown reason"} (length {before} bytes)");
+                WalnutLogger.Exception(ex);
             }
         }
     }
