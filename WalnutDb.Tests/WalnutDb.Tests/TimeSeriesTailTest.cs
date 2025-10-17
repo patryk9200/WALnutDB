@@ -1,4 +1,5 @@
 ﻿#nullable enable
+using System.Buffers.Binary;
 using WalnutDb.Core;
 using WalnutDb.Wal;
 
@@ -153,5 +154,41 @@ public sealed class TimeSeriesTailTests
         var ts = await OpenTsAsync(db);
         var res = await MaterializeAsync(ts.QueryTailAsync("s1", take));
         Assert.Empty(res);
+    }
+
+    [Fact]
+    public async Task Recovery_Truncates_Torn_Frame_For_TimeSeries()
+    {
+        var dir = NewTempDir();
+        var walPath = Path.Combine(dir, "wal.log");
+
+        await using (var db = new WalnutDatabase(dir, new DatabaseOptions(), new FileSystemManifestStore(dir), new WalWriter(walPath)))
+        {
+            var ts = await OpenTsAsync(db);
+            var baseUtc = new DateTime(2024, 06, 06, 6, 0, 0, DateTimeKind.Utc);
+            for (int i = 0; i < 3; i++)
+                await ts.AppendAsync(new TailPoint { SeriesId = "s1", Ts = baseUtc.AddMinutes(i), Value = i });
+            await db.FlushAsync();
+        }
+
+        var goodLength = new FileInfo(walPath).Length;
+
+        await using (var fs = new FileStream(walPath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite))
+        {
+            var lenBuf = new byte[4];
+            BinaryPrimitives.WriteUInt32LittleEndian(lenBuf.AsSpan(), 512u);
+            await fs.WriteAsync(lenBuf, 0, lenBuf.Length);
+            await fs.FlushAsync();
+        }
+
+        await using (var db2 = new WalnutDatabase(dir, new DatabaseOptions(), new FileSystemManifestStore(dir), new WalWriter(walPath)))
+        {
+            var ts2 = await OpenTsAsync(db2);
+            var points = await MaterializeAsync(ts2.QueryTailAsync("s1", take: 10));
+            Assert.Equal(3, points.Count);
+            Assert.Equal(new[] { 2, 1, 0 }, points.Select(p => p.Value));
+        }
+
+        Assert.Equal(goodLength, new FileInfo(walPath).Length);
     }
 }
