@@ -175,9 +175,9 @@ public sealed class TimeSeriesTailTests
 
         await using (var fs = new FileStream(walPath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite))
         {
-            Span<byte> lenBuf = stackalloc byte[4];
-            BinaryPrimitives.WriteUInt32LittleEndian(lenBuf, 512u);
-            await fs.WriteAsync(lenBuf);
+            var lenBuf = new byte[4];
+            WriteUInt32LE(lenBuf, 512u);
+            await fs.WriteAsync(lenBuf, 0, lenBuf.Length);
             await fs.FlushAsync();
         }
 
@@ -190,5 +190,13 @@ public sealed class TimeSeriesTailTests
         }
 
         Assert.Equal(goodLength, new FileInfo(walPath).Length);
+    }
+
+    private static void WriteUInt32LE(byte[] buffer, uint value)
+    {
+        buffer[0] = (byte)(value & 0xFF);
+        buffer[1] = (byte)((value >> 8) & 0xFF);
+        buffer[2] = (byte)((value >> 16) & 0xFF);
+        buffer[3] = (byte)((value >> 24) & 0xFF);
     }
 }

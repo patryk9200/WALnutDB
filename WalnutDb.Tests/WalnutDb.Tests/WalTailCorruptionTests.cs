@@ -1,5 +1,4 @@
 ﻿#nullable enable
-using System.Buffers.Binary;
 using WalnutDb;
 using WalnutDb.Core;
 using WalnutDb.Wal;
@@ -66,9 +65,9 @@ public sealed class WalTailCorruptionTests
         // Append an incomplete frame (length without payload)
         await using (var fs = new FileStream(walPath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite))
         {
-            Span<byte> lenBuf = stackalloc byte[4];
-            BinaryPrimitives.WriteUInt32LittleEndian(lenBuf, 1024u);
-            await fs.WriteAsync(lenBuf);
+            var lenBuf = new byte[4];
+            WriteUInt32LE(lenBuf, 1024u);
+            await fs.WriteAsync(lenBuf, 0, lenBuf.Length);
             await fs.FlushAsync();
         }
 
@@ -126,12 +125,12 @@ public sealed class WalTailCorruptionTests
         using (var fs = new FileStream(walPath, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite))
         {
             fs.Seek(-4, SeekOrigin.End);
-            Span<byte> crcBuf = stackalloc byte[4];
-            int read = fs.Read(crcBuf);
+            var crcBuf = new byte[4];
+            int read = fs.Read(crcBuf, 0, crcBuf.Length);
             Assert.Equal(4, read);
             crcBuf[0] ^= 0xFF; // flip a few bits to make CRC invalid
             fs.Seek(-4, SeekOrigin.End);
-            fs.Write(crcBuf);
+            fs.Write(crcBuf, 0, crcBuf.Length);
             fs.Flush();
         }
 
@@ -146,5 +145,13 @@ public sealed class WalTailCorruptionTests
 
         var finalLength = new FileInfo(walPath).Length;
         Assert.Equal(baselineLength, finalLength);
+    }
+
+    private static void WriteUInt32LE(byte[] buffer, uint value)
+    {
+        buffer[0] = (byte)(value & 0xFF);
+        buffer[1] = (byte)((value >> 8) & 0xFF);
+        buffer[2] = (byte)((value >> 16) & 0xFF);
+        buffer[3] = (byte)((value >> 24) & 0xFF);
     }
 }
