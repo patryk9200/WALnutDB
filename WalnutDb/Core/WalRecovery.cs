@@ -186,6 +186,7 @@ internal static class WalRecovery
                             foreach (var act in list) act();
                             pending.Remove(txId);
                         }
+                        lastGoodPosition = fs.Position;
                         break;
                     }
                 default:
@@ -195,16 +196,19 @@ internal static class WalRecovery
                     fs.Position = fs.Length;
                     break;
             }
-
             if (truncateTail)
             {
                 break;
             }
-
-            lastGoodPosition = fs.Position;
         }
 
         // Transakcje bez COMMIT pozostają w pending i są ignorowane — to OK.
+
+        if (!truncateTail && pending.Count > 0)
+        {
+            truncateTail = true;
+            truncateReason ??= $"dangling {pending.Count} transaction(s) without COMMIT";
+        }
 
         if (!truncateTail && fs.Position < fs.Length)
         {
