@@ -206,6 +206,12 @@ internal static class WalRecovery
 
         // Transakcje bez COMMIT pozostają w pending i są ignorowane — to OK.
 
+        if (!truncateTail && fs.Position < fs.Length)
+        {
+            truncateTail = true;
+            truncateReason = $"trailing {fs.Length - fs.Position} byte(s) after last complete frame";
+        }
+
         if (truncateTail)
         {
             long before = fs.Length;
@@ -214,6 +220,7 @@ internal static class WalRecovery
                 WalnutLogger.Warning($"Truncating WAL tail: {truncateReason ?? "unknown reason"} (from {before} to {lastGoodPosition} bytes)");
                 try
                 {
+                    fs.Position = lastGoodPosition;
                     fs.SetLength(lastGoodPosition);
                     fs.Flush(true);
                 }
