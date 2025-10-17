@@ -1,7 +1,7 @@
 ﻿#nullable enable
 namespace WalnutDb.Wal;
 
-public enum WalOp : byte { Begin = 0x01, Put = 0x02, Delete = 0x03, Commit = 0xFF }
+public enum WalOp : byte { Begin = 0x01, Put = 0x02, Delete = 0x03, DropTable = 0x04, Commit = 0xFF }
 
 public interface IWalWriter : IAsyncDisposable
 {

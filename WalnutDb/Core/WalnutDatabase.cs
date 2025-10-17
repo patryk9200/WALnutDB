@@ -1,7 +1,9 @@
-﻿using System.Collections.Concurrent;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 
 using WalnutDb.Indexing;
 using WalnutDb.Sst;
@@ -47,12 +49,13 @@ public sealed class WalnutDatabase : IDatabase
             : Path.Combine(_dir, "wal.log");
 
         var recovered = new ConcurrentDictionary<string, MemTable>();
+        var droppedTables = new HashSet<string>(StringComparer.Ordinal);
 
         if (File.Exists(walPath))
         {
             try
             {
-                WalRecovery.Replay(walPath, recovered, _options.Encryption);
+                WalRecovery.Replay(walPath, recovered, droppedTables, _options.Encryption);
                 AdoptRecoveredTables(recovered);
             }
             catch (Exception ex)
@@ -63,6 +66,9 @@ public sealed class WalnutDatabase : IDatabase
 
         _sstDir = Path.Combine(_dir, "sst");
         Directory.CreateDirectory(_sstDir);
+
+        if (droppedTables.Count > 0)
+            PurgeDroppedArtifacts(droppedTables);
 
         MigrateSstFilenames();
 
@@ -82,6 +88,9 @@ public sealed class WalnutDatabase : IDatabase
             }
         }
 
+        var legacyDangling = new List<(string IndexTable, byte[] Key)>();
+        var legacySeen = new HashSet<string>(StringComparer.Ordinal);
+
         try
         {
             foreach (var name in _tables.Keys.Concat(_sst.Keys).Distinct())
@@ -96,6 +105,14 @@ public sealed class WalnutDatabase : IDatabase
                         if (it.Value.Tombstone) continue;
                         var prefix = IndexKeyCodec.ExtractValuePrefix(it.Key);
                         var pk = IndexKeyCodec.ExtractPrimaryKey(it.Key);
+
+                        if (pk.Length == 0 || !PrimaryRowExistsForIndex(name, pk))
+                        {
+                            if (TryRecordLegacyIndexEntry(name, it.Key, legacyDangling, legacySeen))
+                                memRef.Current.Delete(it.Key);
+                            continue;
+                        }
+
                         TryReserveUnique(name, prefix, pk);
                     }
                 }
@@ -107,6 +124,13 @@ public sealed class WalnutDatabase : IDatabase
                     {
                         var prefix = IndexKeyCodec.ExtractValuePrefix(k);
                         var pk = IndexKeyCodec.ExtractPrimaryKey(k);
+
+                        if (pk.Length == 0 || !PrimaryRowExistsForIndex(name, pk))
+                        {
+                            TryRecordLegacyIndexEntry(name, k, legacyDangling, legacySeen);
+                            continue;
+                        }
+
                         TryReserveUnique(name, prefix, pk);
                     }
                 }
@@ -122,6 +146,18 @@ public sealed class WalnutDatabase : IDatabase
         {
             WalnutLogger.Exception(ex);
             /* seed jest best-effort */
+        }
+
+        if (legacyDangling.Count > 0)
+        {
+            try
+            {
+                ApplyLegacyIndexFixups(legacyDangling);
+            }
+            catch (Exception ex)
+            {
+                WalnutLogger.Exception(ex);
+            }
         }
     }
 
@@ -239,20 +275,164 @@ public sealed class WalnutDatabase : IDatabase
         {
             if (_uniqueGuards.TryGetValue(gk, out var existing))
             {
-                bool ok = ByteArrayEquals(existing, pk);
-                //Diag.U($"RESERVE hit   idx={indexTableName} val={Diag.B64(valuePrefix)} owner={(ok ? "same" : "other")}");
-                return ok;
+                if (ByteArrayEquals(existing, pk))
+                    return true;
+
+                if (!PrimaryRowExistsForIndex(indexTableName, existing) ||
+                    !IndexEntryExists(indexTableName, valuePrefix, existing))
+                {
+                    _uniqueGuards.TryRemove(gk, out _);
+                    continue;
+                }
+
+                return false;
             }
 
             if (_uniqueGuards.TryAdd(gk, pk))
             {
-                //Diag.U($"RESERVE add   idx={indexTableName} val={Diag.B64(valuePrefix)} pk={Diag.B64(pk)}");
                 return true;
             }
             // kolizja podczas Add — pętla
         }
     }
 
+
+    private bool IndexEntryExists(string indexTableName, byte[] valuePrefix, byte[] ownerPk)
+    {
+        var composite = IndexKeyCodec.ComposeIndexEntryKey(valuePrefix, ownerPk);
+
+        if (_tables.TryGetValue(indexTableName, out var memRef))
+        {
+            if (memRef.Current.TryGet(composite, out _))
+                return true;
+
+            if (memRef.Current.HasTombstoneExact(composite))
+                return false;
+        }
+
+        foreach (var (key, _) in ScanSstRange(indexTableName, composite, ExclusiveUpperBound(composite)))
+        {
+            if (ByteArrayEquals(key, composite))
+                return true;
+        }
+
+        return false;
+    }
+
+    private bool PrimaryRowExistsForIndex(string indexTableName, byte[] primaryKey)
+    {
+        var baseTable = TryExtractBaseTableName(indexTableName);
+        if (string.IsNullOrEmpty(baseTable))
+            return true;
+
+        if (_tables.TryGetValue(baseTable, out var memRef))
+        {
+            if (memRef.Current.TryGet(primaryKey, out _))
+                return true;
+
+            if (memRef.Current.HasTombstoneExact(primaryKey))
+                return false;
+        }
+
+        if (_sst.TryGetValue(baseTable, out var sst) && sst.TryGet(primaryKey, out var _))
+            return true;
+
+        return false;
+    }
+
+    private static string? TryExtractBaseTableName(string indexTableName)
+    {
+        const string prefix = "__index__";
+        if (!indexTableName.StartsWith(prefix, StringComparison.Ordinal))
+            return null;
+
+        var rest = indexTableName.Substring(prefix.Length);
+        var sep = rest.IndexOf("__", StringComparison.Ordinal);
+        if (sep <= 0)
+            return null;
+
+        return rest.Substring(0, sep);
+    }
+
+    private bool TryRecordLegacyIndexEntry(string indexTableName, byte[] compositeKey, List<(string IndexTable, byte[] Key)> bag, HashSet<string> seen)
+    {
+        var fingerprint = indexTableName + "|" + Convert.ToBase64String(compositeKey);
+        if (!seen.Add(fingerprint))
+            return false;
+
+        var copy = new byte[compositeKey.Length];
+        Buffer.BlockCopy(compositeKey, 0, copy, 0, compositeKey.Length);
+        bag.Add((indexTableName, copy));
+        return true;
+    }
+
+    private void ApplyLegacyIndexFixups(List<(string IndexTable, byte[] Key)> entries)
+    {
+        if (entries.Count == 0)
+            return;
+
+        WalnutLogger.Warning($"Detected {entries.Count} dangling unique index entr{(entries.Count == 1 ? "y" : "ies")} without owning rows – cleaning up legacy drop artefacts.");
+
+        var grouped = new Dictionary<string, List<byte[]>>(StringComparer.Ordinal);
+        foreach (var entry in entries)
+        {
+            if (!grouped.TryGetValue(entry.IndexTable, out var list))
+            {
+                list = new List<byte[]>();
+                grouped[entry.IndexTable] = list;
+            }
+            list.Add(entry.Key);
+        }
+
+        foreach (var kvp in grouped)
+        {
+            var indexName = kvp.Key;
+            var keys = kvp.Value;
+            int offset = 0;
+            while (offset < keys.Count)
+            {
+                int take = Math.Min(32, keys.Count - offset);
+                var txId = (ulong)(Random.Shared.NextInt64() & long.MaxValue);
+                var seq = (ulong)Interlocked.Increment(ref _nextSeqNo);
+                var frames = new List<ReadOnlyMemory<byte>>(take + 2)
+                {
+                    Wal.WalCodec.BuildBegin(txId, seq)
+                };
+
+                for (int i = 0; i < take; i++)
+                    frames.Add(Wal.WalCodec.BuildDelete(txId, indexName, keys[offset + i]));
+
+                frames.Add(Wal.WalCodec.BuildCommit(txId, take));
+
+                var handle = Wal.AppendTransactionAsync(frames, Durability.Safe).GetAwaiter().GetResult();
+                handle.WhenCommitted.GetAwaiter().GetResult();
+
+                WriterLock.Wait();
+                try
+                {
+                    var mem = GetOrAddMemRef(indexName);
+                    for (int i = 0; i < take; i++)
+                        mem.Current.Delete(keys[offset + i]);
+                }
+                finally
+                {
+                    WriterLock.Release();
+                }
+
+                offset += take;
+            }
+        }
+
+        Wal.FlushAsync().GetAwaiter().GetResult();
+    }
+
+    private static byte[] ExclusiveUpperBound(byte[] key)
+    {
+        var to = new byte[key.Length + 1];
+        Buffer.BlockCopy(key, 0, to, 0, key.Length);
+        to[^1] = 0x00;
+        return to;
+    }
     internal void ReleaseUnique(string indexTableName, byte[] valuePrefix, byte[] pk)
     {
         var gk = MakeGuardKey(indexTableName, valuePrefix);
@@ -915,53 +1095,25 @@ public sealed class WalnutDatabase : IDatabase
 
     public async ValueTask DropTableAsync(string name, CancellationToken ct = default)
     {
-        name = CanonicalizeName(name); // <-- dodaj
+        name = CanonicalizeName(name);
+
+        var txId = (ulong)(Random.Shared.NextInt64() & long.MaxValue);
+        var seq = (ulong)Interlocked.Increment(ref _nextSeqNo);
+
+        var frames = new List<ReadOnlyMemory<byte>>(capacity: 3)
+        {
+            Wal.WalCodec.BuildBegin(txId, seq),
+            Wal.WalCodec.BuildDropTable(txId, name),
+            Wal.WalCodec.BuildCommit(txId, 1)
+        };
+
+        var handle = await Wal.AppendTransactionAsync(frames, Durability.Safe, ct).ConfigureAwait(false);
+        await handle.WhenCommitted.ConfigureAwait(false);
 
         await WriterLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            _tables.TryRemove(name, out _);
-
-            if (_sst.TryRemove(name, out var sst))
-            {
-                try
-                {
-                    sst.Dispose();
-                }
-                catch { /* ignore */ }
-            }
-
-            var safe = EncodeNameToFile(name);
-            var sstPath = Path.Combine(_sstDir, $"{safe}.sst");
-            var tmpPath = Path.Combine(_sstDir, $"{safe}.sst.tmp");
-            TryDeleteFile(sstPath);
-            TryDeleteFile(tmpPath);
-
-            var idxPrefix = $"__index__{name}__";
-            var indexNames = _tables.Keys
-                .Concat(_sst.Keys)
-                .Where(n => n.StartsWith(idxPrefix, StringComparison.Ordinal))
-                .Distinct()
-                .ToArray();
-
-            foreach (var idxName in indexNames)
-            {
-                _tables.TryRemove(idxName, out _);
-
-                if (_sst.TryRemove(idxName, out var idxSst))
-                    try
-                    {
-                        idxSst.Dispose();
-                    }
-                    catch { }
-
-                var idxSafe = EncodeNameToFile(idxName);
-                TryDeleteFile(Path.Combine(_sstDir, $"{idxSafe}.sst"));
-                TryDeleteFile(Path.Combine(_sstDir, $"{idxSafe}.sst.tmp"));
-
-                RemoveUniqueGuardsForIndex(idxName);
-                _indexUnique.TryRemove(idxName, out _);
-            }
+            DropTableInMemory(name);
         }
         finally
         {
@@ -969,15 +1121,131 @@ public sealed class WalnutDatabase : IDatabase
         }
 
         await Wal.FlushAsync(ct).ConfigureAwait(false);
+    }
 
-        static void TryDeleteFile(string path)
+    private void DropTableInMemory(string name)
+    {
+        if (_tables.TryRemove(name, out var memRef))
+        {
+            memRef.Swap(new MemTable());
+        }
+
+        _metrics.TryRemove(name, out _);
+        _indexUnique.TryRemove(name, out _);
+
+        if (_sst.TryRemove(name, out var sst))
         {
             try
             {
-                if (File.Exists(path))
-                    File.Delete(path);
+                sst.Dispose();
             }
-            catch { /* best-effort */ }
+            catch { /* ignore */ }
+        }
+
+        DeleteTableFiles(name);
+
+        var idxPrefix = $"__index__{name}__";
+        var indexNames = _tables.Keys
+            .Concat(_sst.Keys)
+            .Where(n => n.StartsWith(idxPrefix, StringComparison.Ordinal))
+            .Distinct()
+            .ToArray();
+
+        foreach (var idxName in indexNames)
+        {
+            if (_tables.TryRemove(idxName, out var idxRef))
+            {
+                idxRef.Swap(new MemTable());
+            }
+
+            _metrics.TryRemove(idxName, out _);
+
+            if (_sst.TryRemove(idxName, out var idxSst))
+            {
+                try
+                {
+                    idxSst.Dispose();
+                }
+                catch { /* ignore */ }
+            }
+
+            DeleteTableFiles(idxName);
+            RemoveUniqueGuardsForIndex(idxName);
+            _indexUnique.TryRemove(idxName, out _);
+        }
+    }
+
+    private void DeleteTableFiles(string canonicalName)
+    {
+        var safe = EncodeNameToFile(canonicalName);
+        TryDeleteFile(Path.Combine(_sstDir, $"{safe}.sst"));
+        TryDeleteFile(Path.Combine(_sstDir, $"{safe}.sst.sxi"));
+        TryDeleteFile(Path.Combine(_sstDir, $"{safe}.sst.tmp"));
+        TryDeleteFile(Path.Combine(_sstDir, $"{safe}.sst.tmp.sxi"));
+    }
+
+    private static void TryDeleteFile(string path)
+    {
+        try
+        {
+            if (File.Exists(path))
+                File.Delete(path);
+        }
+        catch { /* best-effort */ }
+    }
+
+    private void PurgeDroppedArtifacts(ISet<string> droppedTables)
+    {
+        if (droppedTables.Count == 0)
+            return;
+
+        var indexPrefixes = droppedTables.Select(t => $"__index__{t}__").ToArray();
+
+        bool IsDropped(string canonical)
+        {
+            if (droppedTables.Contains(canonical))
+                return true;
+
+            foreach (var prefix in indexPrefixes)
+                if (canonical.StartsWith(prefix, StringComparison.Ordinal))
+                    return true;
+
+            return false;
+        }
+
+        foreach (var file in Directory.EnumerateFiles(_sstDir, "*.sst"))
+        {
+            var baseName = Path.GetFileNameWithoutExtension(file);
+            var logical = DecodeNameFromFile(baseName);
+            var canonical = CanonicalizeName(logical);
+            if (IsDropped(canonical))
+            {
+                TryDeleteFile(file);
+                TryDeleteFile(file + ".sxi");
+            }
+        }
+
+        foreach (var file in Directory.EnumerateFiles(_sstDir, "*.sst.tmp"))
+        {
+            var fn = Path.GetFileName(file);
+            var stem = fn.Substring(0, fn.Length - ".sst.tmp".Length);
+            var logical = DecodeNameFromFile(stem);
+            var canonical = CanonicalizeName(logical);
+            if (IsDropped(canonical))
+            {
+                TryDeleteFile(file);
+                TryDeleteFile(file + ".sxi");
+            }
+        }
+
+        foreach (var file in Directory.EnumerateFiles(_sstDir, "*.sst.tmp.sxi"))
+        {
+            var fn = Path.GetFileName(file);
+            var stem = fn.Substring(0, fn.Length - ".sst.tmp.sxi".Length);
+            var logical = DecodeNameFromFile(stem);
+            var canonical = CanonicalizeName(logical);
+            if (IsDropped(canonical))
+                TryDeleteFile(file);
         }
     }
 
