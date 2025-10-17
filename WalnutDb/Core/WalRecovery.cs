@@ -1,6 +1,8 @@
 ﻿#nullable enable
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
 using System.Text;
 using WalnutDb;
 
@@ -13,7 +15,10 @@ namespace WalnutDb.Core;
 /// </summary>
 internal static class WalRecovery
 {
-    public static void Replay(string walPath, ConcurrentDictionary<string, MemTable> tables, IEncryption? encryption = null)
+    public static void Replay(string walPath,
+                              ConcurrentDictionary<string, MemTable> tables,
+                              ISet<string> droppedTables,
+                              IEncryption? encryption = null)
     {
         if (!File.Exists(walPath)) return;
 
@@ -170,6 +175,33 @@ internal static class WalRecovery
                         });
                         break;
                     }
+                case Wal.WalOp.DropTable:
+                    {
+                        if (span.Length < 1 + 8 + 2)
+                        {
+                            truncateReason = $"DROP frame too short ({span.Length} bytes) at offset {frameStart}";
+                            truncateTail = true;
+                            break;
+                        }
+
+                        ulong txId = BinaryPrimitives.ReadUInt64LittleEndian(span.Slice(1, 8));
+                        ushort tlen = BinaryPrimitives.ReadUInt16LittleEndian(span.Slice(9, 2));
+                        int off = 11;
+                        if (off + tlen > span.Length)
+                        {
+                            truncateReason = $"DROP frame payload truncated at offset {frameStart}";
+                            truncateTail = true;
+                            break;
+                        }
+
+                        string table = Encoding.UTF8.GetString(span.Slice(off, tlen));
+
+                        if (!pending.TryGetValue(txId, out var list))
+                            list = pending[txId] = new List<Action>(8);
+
+                        list.Add(() => DropRecoveredTable(tables, droppedTables, table));
+                        break;
+                    }
                 case Wal.WalOp.Commit:
                     {
                         if (span.Length < 1 + 8 + 4)
@@ -254,6 +286,21 @@ internal static class WalRecovery
 
     private static bool TryReadExactly(Stream s, byte[] dst)
         => TryReadExactly(s, dst.AsSpan());
+
+    private static void DropRecoveredTable(ConcurrentDictionary<string, MemTable> tables, ISet<string> droppedTables, string canonicalName)
+    {
+        tables.TryRemove(canonicalName, out _);
+
+        var idxPrefix = $"__index__{canonicalName}__";
+        var toRemove = tables.Keys
+            .Where(n => n.StartsWith(idxPrefix, StringComparison.Ordinal))
+            .ToArray();
+
+        foreach (var idx in toRemove)
+            tables.TryRemove(idx, out _);
+
+        droppedTables.Add(canonicalName);
+    }
 
     // lokalny CRC32 (polinom 0xEDB88320)
     private sealed class Crc32
