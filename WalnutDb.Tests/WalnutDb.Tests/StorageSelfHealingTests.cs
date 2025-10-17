@@ -8,7 +8,7 @@ using Xunit;
 
 namespace WalnutDb.Tests;
 
-file sealed class HealUser
+internal sealed class HealUser
 {
     [DatabaseObjectId] public string Id { get; set; } = "";
 
