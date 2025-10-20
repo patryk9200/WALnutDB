@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Linq;
 using WalnutDb.Diagnostics;
+using WalnutDb.Wal;
 
 namespace WalnutDb.Tooling;
 
