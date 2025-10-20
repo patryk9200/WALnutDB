@@ -42,6 +42,11 @@ public sealed class WalDiagnosticsTests
 
         var report = WalDiagnostics.Scan(walPath, tailHistory: 0);
 
-        Assert.Contains(report.RepeatedKeys, rk => rk.Table == "diag_docs" && rk.PutCount >= 3 && rk.KeyHex.StartsWith("647570", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(report.RepeatedKeys, rk =>
+            rk.Table == "diag_docs"
+            && rk.PutCount >= 3
+            && rk.IsPutOnly
+            && rk.NetPutCount >= 3
+            && rk.KeyHex.StartsWith("647570", StringComparison.OrdinalIgnoreCase));
     }
 }

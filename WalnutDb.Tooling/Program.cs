@@ -129,7 +129,10 @@ internal static class Program
             Console.WriteLine("  Repeated keys (table/key with multiple PUT/DELETE frames in the captured history):");
             foreach (var keyInfo in report.RepeatedKeys)
             {
-                Console.WriteLine($"    {keyInfo.Table} key={keyInfo.KeyHex} puts={keyInfo.PutCount} deletes={keyInfo.DeleteCount}");
+                var suffix = keyInfo.IsPutOnly
+                    ? " put-only"
+                    : keyInfo.NetPutCount != 0 ? $" net={keyInfo.NetPutCount:+#;-#;0}" : string.Empty;
+                Console.WriteLine($"    {keyInfo.Table} key={keyInfo.KeyHex} puts={keyInfo.PutCount} deletes={keyInfo.DeleteCount}{suffix}");
             }
         }
 

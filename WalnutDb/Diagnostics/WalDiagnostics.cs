@@ -38,7 +38,11 @@ public sealed record WalScanResult(
     IReadOnlyCollection<string> TablesTouched,
     IReadOnlyList<WalRepeatedKeyInfo> RepeatedKeys);
 
-public sealed record WalRepeatedKeyInfo(string Table, string KeyHex, int PutCount, int DeleteCount);
+public sealed record WalRepeatedKeyInfo(string Table, string KeyHex, int PutCount, int DeleteCount)
+{
+    public bool IsPutOnly => DeleteCount == 0 && PutCount > 0;
+    public int NetPutCount => PutCount - DeleteCount;
+}
 
 public static class WalDiagnostics
 {
