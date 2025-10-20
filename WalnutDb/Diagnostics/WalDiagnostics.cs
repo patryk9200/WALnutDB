@@ -24,6 +24,7 @@ public sealed record WalScanResult(
     int PutCount,
     int DeleteCount,
     int DropCount,
+    int TailHistoryLimit,
     IReadOnlyList<PendingTransactionInfo> PendingTransactions,
     IReadOnlyList<WalFrameInfo> TailFrames,
     IReadOnlyCollection<string> TablesTouched);
@@ -38,7 +39,11 @@ public static class WalDiagnostics
         if (!File.Exists(walPath))
             throw new FileNotFoundException($"WAL file '{walPath}' was not found.", walPath);
 
-        tailHistory = Math.Clamp(tailHistory, 1, 4096);
+        const int MaxTailHistory = 65_536;
+        bool captureAll = tailHistory <= 0;
+        int effectiveTailHistory = captureAll
+            ? int.MaxValue
+            : Math.Clamp(tailHistory, 1, MaxTailHistory);
 
         using var fs = new FileStream(walPath, new FileStreamOptions
         {
@@ -53,7 +58,8 @@ public static class WalDiagnostics
 
         var crc = new WalRecoveryCrc32();
         var pendingOps = new Dictionary<ulong, int>();
-        var tailFrames = new Queue<WalFrameInfo>(tailHistory);
+        List<WalFrameInfo>? tailAll = captureAll ? new List<WalFrameInfo>() : null;
+        Queue<WalFrameInfo>? tailFrames = captureAll ? null : new Queue<WalFrameInfo>(effectiveTailHistory);
         var tables = new HashSet<string>(StringComparer.Ordinal);
 
         int frameCount = 0, beginCount = 0, commitCount = 0, putCount = 0, deleteCount = 0, dropCount = 0;
@@ -233,9 +239,17 @@ public static class WalDiagnostics
             if (truncateTail)
                 break;
 
-            if (tailFrames.Count == tailHistory)
-                tailFrames.Dequeue();
-            tailFrames.Enqueue(new WalFrameInfo(frameStart, op, txId, tableName, keyLen, valueLen, keyPreview));
+            var frameInfo = new WalFrameInfo(frameStart, op, txId, tableName, keyLen, valueLen, keyPreview);
+            if (captureAll)
+            {
+                tailAll!.Add(frameInfo);
+            }
+            else
+            {
+                if (tailFrames!.Count == effectiveTailHistory)
+                    tailFrames.Dequeue();
+                tailFrames.Enqueue(frameInfo);
+            }
         }
 
         if (!truncateTail && pendingOps.Count > 0)
@@ -255,6 +269,10 @@ public static class WalDiagnostics
             .Select(kv => new PendingTransactionInfo(kv.Key, kv.Value))
             .ToList();
 
+        var finalTailFrames = captureAll
+            ? (IReadOnlyList<WalFrameInfo>)tailAll!
+            : tailFrames!.ToList();
+
         return new WalScanResult(
             FileLength: fs.Length,
             LastGoodOffset: lastGoodPosition,
@@ -266,8 +284,9 @@ public static class WalDiagnostics
             PutCount: putCount,
             DeleteCount: deleteCount,
             DropCount: dropCount,
+            TailHistoryLimit: effectiveTailHistory,
             PendingTransactions: pendingInfo,
-            TailFrames: tailFrames.ToList(),
+            TailFrames: finalTailFrames,
             TablesTouched: tables.ToArray());
     }
 

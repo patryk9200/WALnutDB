@@ -44,8 +44,18 @@ internal static class Program
 
         var walPath = args[0];
         int history = 32;
-        if (args.Length > 1 && int.TryParse(args[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed) && parsed > 0)
-            history = parsed;
+        if (args.Length > 1)
+        {
+            var historyArg = args[1];
+            if (string.Equals(historyArg, "all", StringComparison.OrdinalIgnoreCase))
+            {
+                history = 0; // capture entire history
+            }
+            else if (int.TryParse(historyArg, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed) && parsed > 0)
+            {
+                history = parsed;
+            }
+        }
 
         var report = WalDiagnostics.Scan(walPath, history);
 
@@ -84,9 +94,17 @@ internal static class Program
             Console.WriteLine("  Tables touched: none");
         }
 
+        string framesHeader = report.TailHistoryLimit == int.MaxValue
+            ? $"  Tail frames (showing all {report.TailFrames.Count} frame(s))"
+            : $"  Tail frames (showing last {report.TailFrames.Count} of {report.FrameCount} frame(s){(report.FrameCount > report.TailFrames.Count ? $", limit {report.TailHistoryLimit}" : string.Empty)})";
+        Console.WriteLine(framesHeader + ":");
+
         if (report.TailFrames.Count > 0)
         {
-            Console.WriteLine("  Tail frames:");
+            var first = report.TailFrames.First();
+            var last = report.TailFrames.Last();
+            Console.WriteLine($"    (offset range {first.Offset:N0} – {last.Offset:N0})");
+
             foreach (var frame in report.TailFrames)
             {
                 var table = frame.Table is null ? string.Empty : $" table={frame.Table}";
@@ -100,6 +118,10 @@ internal static class Program
                 };
                 Console.WriteLine($"    @{frame.Offset:N0}: {frame.OpCode}{tx}{table}{extra}{keyPreview}");
             }
+        }
+        else
+        {
+            Console.WriteLine("    <none>");
         }
 
         return 0;
