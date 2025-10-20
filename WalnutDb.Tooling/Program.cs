@@ -124,6 +124,15 @@ internal static class Program
             Console.WriteLine("    <none>");
         }
 
+        if (report.RepeatedKeys.Count > 0)
+        {
+            Console.WriteLine("  Repeated keys (table/key with multiple PUT/DELETE frames in the captured history):");
+            foreach (var keyInfo in report.RepeatedKeys)
+            {
+                Console.WriteLine($"    {keyInfo.Table} key={keyInfo.KeyHex} puts={keyInfo.PutCount} deletes={keyInfo.DeleteCount}");
+            }
+        }
+
         return 0;
     }
 
@@ -183,8 +192,8 @@ internal static class Program
     private static void PrintUsage()
     {
         Console.WriteLine("WalnutDb.Tooling usage:");
-        Console.WriteLine("  dotnet run --project WalnutDb.Tooling -- wal <path-to-wal.log> [tailHistory]");
-        Console.WriteLine("    Parses wal.log, validates frames, and prints tail diagnostics.");
+        Console.WriteLine("  dotnet run --project WalnutDb.Tooling -- wal <path-to-wal.log> [tailHistory|all]");
+        Console.WriteLine("    Parses wal.log, validates frames, and prints tail diagnostics (use 'all' to show every frame).");
         Console.WriteLine("  dotnet run --project WalnutDb.Tooling -- sst <path-to-sst-dir> [--recursive]");
         Console.WriteLine("    Validates SST tables (headers, record layout, trailers, indexes).");
     }

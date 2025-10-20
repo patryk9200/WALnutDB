@@ -9,7 +9,15 @@ using WalnutDb.Wal;
 
 namespace WalnutDb.Diagnostics;
 
-public sealed record WalFrameInfo(long Offset, WalOp OpCode, ulong TxId, string? Table, int KeyLength, int ValueLength, string? KeyPreview);
+public sealed record WalFrameInfo(
+    long Offset,
+    WalOp OpCode,
+    ulong TxId,
+    string? Table,
+    int KeyLength,
+    int ValueLength,
+    string? KeyPreview,
+    byte[]? KeyBytes);
 
 public sealed record PendingTransactionInfo(ulong TxId, int OperationCount);
 
@@ -27,7 +35,10 @@ public sealed record WalScanResult(
     int TailHistoryLimit,
     IReadOnlyList<PendingTransactionInfo> PendingTransactions,
     IReadOnlyList<WalFrameInfo> TailFrames,
-    IReadOnlyCollection<string> TablesTouched);
+    IReadOnlyCollection<string> TablesTouched,
+    IReadOnlyList<WalRepeatedKeyInfo> RepeatedKeys);
+
+public sealed record WalRepeatedKeyInfo(string Table, string KeyHex, int PutCount, int DeleteCount);
 
 public static class WalDiagnostics
 {
@@ -117,6 +128,7 @@ public static class WalDiagnostics
             int keyLen = 0;
             int valueLen = 0;
             string? keyPreview = null;
+            byte[]? keyBytes = null;
 
             switch (op)
             {
@@ -155,7 +167,9 @@ public static class WalDiagnostics
                             break;
                         }
                         tableName = Encoding.UTF8.GetString(span.Slice(off, tlen));
-                        keyPreview = ToPreview(span.Slice(off + tlen, keyLen));
+                        var keySlice = span.Slice(off + tlen, keyLen);
+                        keyPreview = ToPreview(keySlice);
+                        keyBytes = keySlice.ToArray();
                         tables.Add(tableName);
                         if (pendingOps.TryGetValue(txId, out var count))
                             pendingOps[txId] = count + 1;
@@ -182,7 +196,9 @@ public static class WalDiagnostics
                             break;
                         }
                         tableName = Encoding.UTF8.GetString(span.Slice(off, tlen));
-                        keyPreview = ToPreview(span.Slice(off + tlen, keyLen));
+                        var keySlice = span.Slice(off + tlen, keyLen);
+                        keyPreview = ToPreview(keySlice);
+                        keyBytes = keySlice.ToArray();
                         tables.Add(tableName);
                         if (pendingOps.TryGetValue(txId, out var count))
                             pendingOps[txId] = count + 1;
@@ -239,7 +255,7 @@ public static class WalDiagnostics
             if (truncateTail)
                 break;
 
-            var frameInfo = new WalFrameInfo(frameStart, op, txId, tableName, keyLen, valueLen, keyPreview);
+            var frameInfo = new WalFrameInfo(frameStart, op, txId, tableName, keyLen, valueLen, keyPreview, keyBytes);
             if (captureAll)
             {
                 tailAll!.Add(frameInfo);
@@ -272,6 +288,7 @@ public static class WalDiagnostics
         var finalTailFrames = captureAll
             ? (IReadOnlyList<WalFrameInfo>)tailAll!
             : tailFrames!.ToList();
+        var repeatedKeys = SummarizeRepeatedKeys(finalTailFrames);
 
         return new WalScanResult(
             FileLength: fs.Length,
@@ -284,10 +301,11 @@ public static class WalDiagnostics
             PutCount: putCount,
             DeleteCount: deleteCount,
             DropCount: dropCount,
-            TailHistoryLimit: effectiveTailHistory,
+            TailHistoryLimit: captureAll ? int.MaxValue : effectiveTailHistory,
             PendingTransactions: pendingInfo,
             TailFrames: finalTailFrames,
-            TablesTouched: tables.ToArray());
+            TablesTouched: tables.ToArray(),
+            RepeatedKeys: repeatedKeys);
     }
 
     private sealed class WalRecoveryCrc32
@@ -330,6 +348,58 @@ public static class WalDiagnostics
 
     private static bool TryReadExactly(Stream stream, byte[] destination)
         => TryReadExactly(stream, destination.AsSpan());
+
+    private static IReadOnlyList<WalRepeatedKeyInfo> SummarizeRepeatedKeys(IReadOnlyList<WalFrameInfo> frames)
+    {
+        if (frames.Count == 0)
+            return Array.Empty<WalRepeatedKeyInfo>();
+
+        var summary = new Dictionary<(string Table, string KeyHex), (int Put, int Delete)>(StringComparer.Ordinal);
+
+        foreach (var frame in frames)
+        {
+            if (frame.Table is null || frame.KeyBytes is null || frame.KeyBytes.Length == 0)
+                continue;
+
+            var keyHex = Convert.ToHexString(frame.KeyBytes);
+            var key = (frame.Table, keyHex);
+            if (!summary.TryGetValue(key, out var counts))
+                counts = (0, 0);
+
+            switch (frame.OpCode)
+            {
+                case WalOp.Put:
+                    counts.Put++;
+                    break;
+                case WalOp.Delete:
+                    counts.Delete++;
+                    break;
+                default:
+                    continue;
+            }
+
+            summary[key] = counts;
+        }
+
+        if (summary.Count == 0)
+            return Array.Empty<WalRepeatedKeyInfo>();
+
+        var result = new List<WalRepeatedKeyInfo>(summary.Count);
+        foreach (var kvp in summary)
+        {
+            int total = kvp.Value.Put + kvp.Value.Delete;
+            if (total <= 1)
+                continue;
+
+            result.Add(new WalRepeatedKeyInfo(kvp.Key.Table, kvp.Key.KeyHex, kvp.Value.Put, kvp.Value.Delete));
+        }
+
+        return result
+            .OrderByDescending(r => r.Put + r.Delete)
+            .ThenBy(r => r.Table, StringComparer.Ordinal)
+            .ThenBy(r => r.KeyHex, StringComparer.Ordinal)
+            .ToList();
+    }
 
     private static string ToPreview(ReadOnlySpan<byte> key)
     {
