@@ -37,7 +37,7 @@ public sealed class WalWriter : IWalWriter
         {
             Mode = FileMode.OpenOrCreate,
             Access = FileAccess.ReadWrite,
-            Share = FileShare.Read, // odczyt recovery równolegle OK
+            Share = FileShare.ReadWrite, // pozwól recovery otworzyć uchwyt RW (truncate)
             Options = FileOptions.Asynchronous | FileOptions.SequentialScan | FileOptions.WriteThrough
         });
         _fs.Seek(0, SeekOrigin.End);
@@ -97,6 +97,13 @@ public sealed class WalWriter : IWalWriter
                 var sw = ValueStopwatch.StartNew();
                 while (pending.Count < _maxBatch && sw.Elapsed < _groupWindow && reader.TryRead(out var item))
                     pending.Add(item);
+
+                // Always append at the current physical end of the file. Recovery may have
+                // truncated the underlying stream, so reset the position to Length before
+                // emitting the next batch to avoid leaving zero-filled gaps that would break
+                // subsequent replays.
+                if (_fs.Position != _fs.Length)
+                    _fs.Seek(0, SeekOrigin.End);
 
                 foreach (var item in pending)
                     foreach (var frame in item.Frames)
