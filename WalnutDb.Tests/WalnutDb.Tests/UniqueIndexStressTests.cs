@@ -137,9 +137,25 @@ public sealed class UniqueIndexStressTests
         var t1 = tbl.UpsertAsync(new UxStressUser { Id = "A", Email = email }).AsTask();
         var t2 = tbl.UpsertAsync(new UxStressUser { Id = "B", Email = email }).AsTask();
 
-        await Task.WhenAll(Task.WhenAny(t1, t2));
-        var ok1 = t1.IsCompletedSuccessfully;
-        var ok2 = t2.IsCompletedSuccessfully;
+        bool ok1 = false, ok2 = false;
+
+        try
+        {
+            await t1;
+            ok1 = true;
+        }
+        catch (InvalidOperationException)
+        {
+        }
+
+        try
+        {
+            await t2;
+            ok2 = true;
+        }
+        catch (InvalidOperationException)
+        {
+        }
 
         await db.CheckpointAsync();
 
