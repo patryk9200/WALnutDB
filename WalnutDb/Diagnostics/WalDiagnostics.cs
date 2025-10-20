@@ -42,6 +42,12 @@ public sealed record WalRepeatedKeyInfo(string Table, string KeyHex, int PutCoun
 
 public static class WalDiagnostics
 {
+    private struct KeyCounters
+    {
+        public int Put;
+        public int Delete;
+    }
+
     public static WalScanResult Scan(string walPath, int tailHistory = 32)
     {
         if (string.IsNullOrWhiteSpace(walPath))
@@ -354,7 +360,7 @@ public static class WalDiagnostics
         if (frames.Count == 0)
             return Array.Empty<WalRepeatedKeyInfo>();
 
-        var summary = new Dictionary<(string Table, string KeyHex), (int Put, int Delete)>();
+        var summary = new Dictionary<(string Table, string KeyHex), KeyCounters>();
 
         foreach (var frame in frames)
         {
@@ -364,7 +370,7 @@ public static class WalDiagnostics
             var keyHex = Convert.ToHexString(frame.KeyBytes);
             var key = (frame.Table, keyHex);
             if (!summary.TryGetValue(key, out var counts))
-                counts = (0, 0);
+                counts = default;
 
             switch (frame.OpCode)
             {
