@@ -354,7 +354,7 @@ public static class WalDiagnostics
         if (frames.Count == 0)
             return Array.Empty<WalRepeatedKeyInfo>();
 
-        var summary = new Dictionary<(string Table, string KeyHex), (int Put, int Delete)>(StringComparer.Ordinal);
+        var summary = new Dictionary<(string Table, string KeyHex), (int Put, int Delete)>();
 
         foreach (var frame in frames)
         {
@@ -395,7 +395,7 @@ public static class WalDiagnostics
         }
 
         return result
-            .OrderByDescending(r => r.Put + r.Delete)
+            .OrderByDescending(r => r.PutCount + r.DeleteCount)
             .ThenBy(r => r.Table, StringComparer.Ordinal)
             .ThenBy(r => r.KeyHex, StringComparer.Ordinal)
             .ToList();
