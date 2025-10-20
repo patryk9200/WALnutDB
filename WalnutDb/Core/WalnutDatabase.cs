@@ -98,10 +98,12 @@ public sealed class WalnutDatabase : IDatabase
             {
                 if (!name.StartsWith("__index__", StringComparison.Ordinal)) continue;
 
+                _tables.TryGetValue(name, out var indexMemRef);
+
                 // MEM
-                if (_tables.TryGetValue(name, out var memRef))
+                if (indexMemRef is not null)
                 {
-                    foreach (var it in memRef.Current.SnapshotAll(null))
+                    foreach (var it in indexMemRef.Current.SnapshotAll(null))
                     {
                         if (it.Value.Tombstone) continue;
                         var prefix = IndexKeyCodec.ExtractValuePrefix(it.Key);
@@ -110,7 +112,7 @@ public sealed class WalnutDatabase : IDatabase
                         if (pk.Length == 0 || !PrimaryRowExistsForIndex(name, pk))
                         {
                             if (TryRecordLegacyIndexEntry(name, it.Key, legacyDangling, legacySeen))
-                                memRef.Current.Delete(it.Key);
+                                indexMemRef.Current.Delete(it.Key);
                             continue;
                         }
 
@@ -123,6 +125,9 @@ public sealed class WalnutDatabase : IDatabase
                 {
                     foreach (var (k, _) in sst.ScanRange(Array.Empty<byte>(), Array.Empty<byte>()))
                     {
+                        if (indexMemRef is not null && indexMemRef.Current.HasTombstoneExact(k))
+                            continue;
+
                         var prefix = IndexKeyCodec.ExtractValuePrefix(k);
                         var pk = IndexKeyCodec.ExtractPrimaryKey(k);
 
@@ -568,7 +573,14 @@ public sealed class WalnutDatabase : IDatabase
                 {
                     var mem = GetOrAddMemRef(indexName);
                     for (int i = 0; i < take; i++)
-                        mem.Current.Delete(keys[offset + i]);
+                    {
+                        var composite = keys[offset + i];
+                        mem.Current.Delete(composite);
+
+                        var prefix = IndexKeyCodec.ExtractValuePrefix(composite);
+                        var pk = IndexKeyCodec.ExtractPrimaryKey(composite);
+                        ReleaseUnique(indexName, prefix, pk);
+                    }
                 }
                 finally
                 {
