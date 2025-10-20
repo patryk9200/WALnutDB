@@ -18,9 +18,14 @@ internal static class Program
         var command = args[0];
         try
         {
-            return command.Equals("wal", StringComparison.OrdinalIgnoreCase)
-                ? RunWalScan(args.Skip(1).ToArray())
-                : FailUnknown(command);
+            return command switch
+            {
+                var c when string.Equals(c, "wal", StringComparison.OrdinalIgnoreCase)
+                    => RunWalScan(args.Skip(1).ToArray()),
+                var c when string.Equals(c, "sst", StringComparison.OrdinalIgnoreCase)
+                    => RunSstScan(args.Skip(1).ToArray()),
+                _ => FailUnknown(command)
+            };
         }
         catch (Exception ex)
         {
@@ -100,6 +105,49 @@ internal static class Program
         return 0;
     }
 
+    private static int RunSstScan(string[] args)
+    {
+        if (args.Length == 0)
+        {
+            Console.Error.WriteLine("Missing SST directory argument.");
+            return 1;
+        }
+
+        var directory = args[0];
+        bool recursive = args.Skip(1).Any(a => string.Equals(a, "-r", StringComparison.OrdinalIgnoreCase) || string.Equals(a, "--recursive", StringComparison.OrdinalIgnoreCase));
+
+        var report = StorageDiagnostics.ScanSstDirectory(directory, recursive);
+
+        Console.WriteLine($"SST directory: {directory}");
+        Console.WriteLine($"  Files scanned: {report.Files.Count}");
+
+        foreach (var file in report.Files)
+        {
+            var declared = file.DeclaredRowCount.HasValue ? file.DeclaredRowCount.Value.ToString("N0") : "?";
+            Console.WriteLine($"    {file.Path}");
+            Console.WriteLine($"      Length:     {file.Length:N0} bytes");
+            Console.WriteLine($"      Rows:       observed={file.ObservedRowCount:N0} declared={declared}");
+            if (file.HasIndex)
+                Console.WriteLine($"      Index:      {(file.IndexValid ? "OK" : "corrupted")}");
+            else
+                Console.WriteLine("      Index:      missing");
+        }
+
+        if (report.Corruptions.Count > 0)
+        {
+            Console.WriteLine("  Detected issues:");
+            foreach (var issue in report.Corruptions)
+            {
+                var offset = issue.Offset >= 0 ? issue.Offset.ToString("N0") : "n/a";
+                Console.WriteLine($"    {issue.Path} @ {offset}: {issue.Reason}");
+            }
+            return 3;
+        }
+
+        Console.WriteLine("  Detected issues: none");
+        return 0;
+    }
+
     private static int FailUnknown(string command)
     {
         Console.Error.WriteLine($"Unknown command '{command}'.");
@@ -115,5 +163,7 @@ internal static class Program
         Console.WriteLine("WalnutDb.Tooling usage:");
         Console.WriteLine("  dotnet run --project WalnutDb.Tooling -- wal <path-to-wal.log> [tailHistory]");
         Console.WriteLine("    Parses wal.log, validates frames, and prints tail diagnostics.");
+        Console.WriteLine("  dotnet run --project WalnutDb.Tooling -- sst <path-to-sst-dir> [--recursive]");
+        Console.WriteLine("    Validates SST tables (headers, record layout, trailers, indexes).");
     }
 }
