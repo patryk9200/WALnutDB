@@ -28,6 +28,7 @@ internal sealed class DefaultTable<T> : ITable<T>
     }
 
     private readonly List<IndexDef> _indexes = new();
+    private bool _indexRecoveryAttempted;
 
     public DefaultTable(WalnutDatabase db, string name, TableOptions<T> options, MemTableRef memRef)
     {
@@ -54,6 +55,102 @@ internal sealed class DefaultTable<T> : ITable<T>
                 });
             }
         }
+
+        RecoverMissingIndexesIfNeeded();
+    }
+
+    private void RecoverMissingIndexesIfNeeded()
+    {
+        if (_indexRecoveryAttempted)
+            return;
+
+        _indexRecoveryAttempted = true;
+
+        if (_indexes.Count == 0)
+            return;
+
+        var toRebuild = new List<IndexDef>();
+        for (int i = 0; i < _indexes.Count; i++)
+        {
+            var idx = _indexes[i];
+            if (_db.ShouldRebuildIndex(_name, idx.IndexTableName))
+                toRebuild.Add(idx);
+        }
+
+        if (toRebuild.Count == 0)
+            return;
+
+        RebuildIndexesWithoutSnapshot(toRebuild);
+    }
+
+    private void RebuildIndexesWithoutSnapshot(List<IndexDef> indexesToRebuild)
+    {
+        WalnutLogger.Warning($"Detected missing index storage for table '{_name}'. Rebuilding {indexesToRebuild.Count} index entr{(indexesToRebuild.Count == 1 ? "y" : "ies")} without creating a full table snapshot.");
+
+        _db.WriterLock.Wait();
+        try
+        {
+            foreach (var idx in indexesToRebuild)
+            {
+                _db.ClearUniqueReservations(idx.IndexTableName);
+                _db.RemoveIndexArtifacts(idx.IndexTableName);
+                idx.Mem.Swap(new MemTable());
+            }
+        }
+        finally
+        {
+            _db.WriterLock.Release();
+        }
+
+        int processedRows = 0;
+        int duplicateSkips = 0;
+
+        var enumerator = GetAllAsync().GetAsyncEnumerator();
+        try
+        {
+            while (enumerator.MoveNextAsync().AsTask().GetAwaiter().GetResult())
+            {
+                var row = enumerator.Current;
+                processedRows++;
+
+                var key = _map.GetKeyBytes(row);
+
+                foreach (var idx in indexesToRebuild)
+                {
+                    var newValObj = idx.Extract(row);
+                    if (newValObj is null)
+                        continue;
+
+                    var prefix = IndexKeyCodec.Encode(newValObj, idx.DecimalScale);
+
+                    if (idx.Unique && !_db.TryReserveUnique(idx.IndexTableName, prefix, key))
+                    {
+                        duplicateSkips++;
+                        continue;
+                    }
+
+                    var idxKey = IndexKeyCodec.ComposeIndexEntryKey(prefix, key);
+                    idx.Mem.Current.Upsert(idxKey, Array.Empty<byte>());
+                }
+            }
+        }
+        finally
+        {
+            enumerator.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        }
+
+        if (processedRows == 0)
+        {
+            WalnutLogger.Warning($"Detected missing index storage for table '{_name}', but no rows were available to rebuild the index state.");
+            return;
+        }
+
+        if (duplicateSkips > 0)
+        {
+            WalnutLogger.Warning($"Skipped {duplicateSkips} duplicate row(s) while enforcing unique index constraints during rebuild.");
+        }
+
+        WalnutLogger.Warning($"Rebuilt index storage for table '{_name}' using {processedRows} row(s) without taking a table snapshot.");
     }
 
     // ---------------- Auto-transakcje ----------------
