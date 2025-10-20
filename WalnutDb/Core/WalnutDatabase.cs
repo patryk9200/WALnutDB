@@ -298,6 +298,37 @@ public sealed class WalnutDatabase : IDatabase
     }
 
 
+    internal void ClearUniqueReservations(string indexTableName)
+    {
+        var prefix = indexTableName + "|";
+        var toRemove = new List<string>();
+
+        foreach (var key in _uniqueGuards.Keys)
+        {
+            if (key.StartsWith(prefix, StringComparison.Ordinal))
+                toRemove.Add(key);
+        }
+
+        foreach (var key in toRemove)
+            _uniqueGuards.TryRemove(key, out _);
+    }
+
+    internal void RemoveIndexArtifacts(string indexTableName)
+    {
+        if (_sst.TryRemove(indexTableName, out var removed))
+        {
+            try { removed.Dispose(); } catch { }
+        }
+
+        var safe = EncodeNameToFile(indexTableName);
+        var sstPath = Path.Combine(_sstDir, safe + ".sst");
+        try { if (File.Exists(sstPath)) File.Delete(sstPath); } catch { }
+
+        var sxiPath = sstPath + ".sxi";
+        try { if (File.Exists(sxiPath)) File.Delete(sxiPath); } catch { }
+    }
+
+
     private bool IndexEntryExists(string indexTableName, byte[] valuePrefix, byte[] ownerPk)
     {
         var composite = IndexKeyCodec.ComposeIndexEntryKey(valuePrefix, ownerPk);
@@ -415,6 +446,80 @@ public sealed class WalnutDatabase : IDatabase
         Buffer.BlockCopy(compositeKey, 0, copy, 0, compositeKey.Length);
         bag.Add((indexTableName, copy));
         return true;
+    }
+
+    internal bool ShouldRebuildIndex(string tableName, string indexTableName)
+    {
+        if (!TableHasLiveRows(tableName))
+            return false;
+
+        if (IndexHasEntries(indexTableName))
+            return false;
+
+        WalnutLogger.Warning($"Index '{indexTableName}' lost its on-disk state while base table '{tableName}' still contains data – scheduling automatic rebuild.");
+        return true;
+    }
+
+    private bool TableHasLiveRows(string tableName)
+    {
+        if (_tables.TryGetValue(tableName, out var memRef))
+        {
+            foreach (var entry in memRef.Current.SnapshotAll(null))
+            {
+                if (!entry.Value.Tombstone && entry.Value.Value is not null)
+                    return true;
+            }
+        }
+
+        foreach (var _ in ScanSstRange(tableName, Array.Empty<byte>(), Array.Empty<byte>()))
+            return true;
+
+        return false;
+    }
+
+    private bool IndexHasEntries(string indexTableName)
+    {
+        if (_tables.TryGetValue(indexTableName, out var memRef))
+        {
+            foreach (var entry in memRef.Current.SnapshotAll(null))
+                if (!entry.Value.Tombstone)
+                    return true;
+        }
+
+        if (_sst.TryGetValue(indexTableName, out var sst))
+        {
+            try
+            {
+                using var it = sst.ScanRange(Array.Empty<byte>(), Array.Empty<byte>()).GetEnumerator();
+                if (it.MoveNext())
+                    return true;
+            }
+            catch (IOException ex)
+            {
+                WalnutLogger.Warning($"Unable to read index segment for '{indexTableName}' ({ex.Message}). It will be rebuilt from the primary table.");
+                if (_sst.TryRemove(indexTableName, out var removed))
+                    removed.Dispose();
+                return false;
+            }
+            catch (Exception ex)
+            {
+                WalnutLogger.Warning($"Unexpected failure while scanning index '{indexTableName}': {ex.Message}. The index will be rebuilt from base data.");
+                if (_sst.TryRemove(indexTableName, out var removed))
+                    removed.Dispose();
+                return false;
+            }
+
+            return false;
+        }
+
+        var safe = EncodeNameToFile(indexTableName);
+        var candidate = Path.Combine(_sstDir, safe + ".sst");
+        if (!File.Exists(candidate))
+            WalnutLogger.Warning($"Index segment '{candidate}' is missing; rebuilding index '{indexTableName}'.");
+        else
+            WalnutLogger.Warning($"Index '{indexTableName}' is not loaded into the SST cache despite existing file '{candidate}'. It will be rebuilt.");
+
+        return false;
     }
 
     private void ApplyLegacyIndexFixups(List<(string IndexTable, byte[] Key)> entries)

@@ -1,4 +1,7 @@
 ﻿#nullable enable
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
 using WalnutDb;
 using WalnutDb.Core;
 using WalnutDb.Wal;
@@ -147,11 +150,64 @@ public sealed class WalTailCorruptionTests
         Assert.Equal(baselineLength, finalLength);
     }
 
+    [Fact]
+    public async Task Recovery_Truncation_Repositions_Writer_For_New_Appends()
+    {
+        var dir = NewTempDir();
+        var walPath = Path.Combine(dir, "wal.log");
+
+        await using (var db = new WalnutDatabase(dir, new DatabaseOptions(), new FileSystemManifestStore(dir), new WalWriter(walPath)))
+        {
+            var t = await db.OpenTableAsync(new TableOptions<CorruptDoc> { GetId = d => d.Id });
+            await t.UpsertAsync(new CorruptDoc { Id = "before" });
+            await db.FlushAsync();
+        }
+
+        var baseline = new FileInfo(walPath).Length;
+
+        // Append a torn frame so recovery trims the WAL.
+        await using (var fs = new FileStream(walPath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite))
+        {
+            var lenBuf = new byte[4];
+            WriteUInt32LE(lenBuf, 512u);
+            await fs.WriteAsync(lenBuf, 0, lenBuf.Length);
+            await fs.FlushAsync();
+        }
+
+        await using (var db2 = new WalnutDatabase(dir, new DatabaseOptions(), new FileSystemManifestStore(dir), new WalWriter(walPath)))
+        {
+            var t2 = await db2.OpenTableAsync(new TableOptions<CorruptDoc> { GetId = d => d.Id });
+            var docs = await MaterializeAsync(t2.GetAllAsync());
+            Assert.Single(docs);
+            Assert.Equal("before", docs[0].Id);
+
+            await t2.UpsertAsync(new CorruptDoc { Id = "after" });
+            await db2.FlushAsync();
+        }
+
+        Assert.True(new FileInfo(walPath).Length > baseline);
+
+        await using (var db3 = new WalnutDatabase(dir, new DatabaseOptions(), new FileSystemManifestStore(dir), new WalWriter(walPath)))
+        {
+            var t3 = await db3.OpenTableAsync(new TableOptions<CorruptDoc> { GetId = d => d.Id });
+            var ids = (await MaterializeAsync(t3.GetAllAsync())).Select(d => d.Id).OrderBy(id => id).ToArray();
+            Assert.Equal(new[] { "after", "before" }, ids);
+        }
+    }
+
     private static void WriteUInt32LE(byte[] buffer, uint value)
     {
         buffer[0] = (byte)(value & 0xFF);
         buffer[1] = (byte)((value >> 8) & 0xFF);
         buffer[2] = (byte)((value >> 16) & 0xFF);
         buffer[3] = (byte)((value >> 24) & 0xFF);
+    }
+
+    private static async Task<List<T>> MaterializeAsync<T>(IAsyncEnumerable<T> source)
+    {
+        var list = new List<T>();
+        await foreach (var item in source)
+            list.Add(item);
+        return list;
     }
 }
