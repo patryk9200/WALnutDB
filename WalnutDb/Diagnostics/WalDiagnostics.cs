@@ -9,7 +9,7 @@ using WalnutDb.Wal;
 
 namespace WalnutDb.Diagnostics;
 
-public sealed record WalFrameInfo(long Offset, WalOp OpCode, string? Table, int KeyLength, int ValueLength);
+public sealed record WalFrameInfo(long Offset, WalOp OpCode, ulong TxId, string? Table, int KeyLength, int ValueLength, string? KeyPreview);
 
 public sealed record PendingTransactionInfo(ulong TxId, int OperationCount);
 
@@ -38,7 +38,7 @@ public static class WalDiagnostics
         if (!File.Exists(walPath))
             throw new FileNotFoundException($"WAL file '{walPath}' was not found.", walPath);
 
-        tailHistory = Math.Clamp(tailHistory, 1, 256);
+        tailHistory = Math.Clamp(tailHistory, 1, 4096);
 
         using var fs = new FileStream(walPath, new FileStreamOptions
         {
@@ -107,8 +107,10 @@ public static class WalDiagnostics
             var span = payload.AsSpan();
             var op = (WalOp)span[0];
             string? tableName = null;
+            ulong txId = 0;
             int keyLen = 0;
             int valueLen = 0;
+            string? keyPreview = null;
 
             switch (op)
             {
@@ -121,7 +123,7 @@ public static class WalDiagnostics
                         break;
                     }
                     {
-                        ulong txId = BinaryPrimitives.ReadUInt64LittleEndian(span.Slice(1, 8));
+                        txId = BinaryPrimitives.ReadUInt64LittleEndian(span.Slice(1, 8));
                         pendingOps[txId] = 0;
                     }
                     break;
@@ -135,7 +137,7 @@ public static class WalDiagnostics
                         break;
                     }
                     {
-                        ulong txId = BinaryPrimitives.ReadUInt64LittleEndian(span.Slice(1, 8));
+                        txId = BinaryPrimitives.ReadUInt64LittleEndian(span.Slice(1, 8));
                         ushort tlen = BinaryPrimitives.ReadUInt16LittleEndian(span.Slice(9, 2));
                         keyLen = BinaryPrimitives.ReadInt32LittleEndian(span.Slice(11, 4));
                         valueLen = BinaryPrimitives.ReadInt32LittleEndian(span.Slice(15, 4));
@@ -147,6 +149,7 @@ public static class WalDiagnostics
                             break;
                         }
                         tableName = Encoding.UTF8.GetString(span.Slice(off, tlen));
+                        keyPreview = ToPreview(span.Slice(off + tlen, keyLen));
                         tables.Add(tableName);
                         if (pendingOps.TryGetValue(txId, out var count))
                             pendingOps[txId] = count + 1;
@@ -162,7 +165,7 @@ public static class WalDiagnostics
                         break;
                     }
                     {
-                        ulong txId = BinaryPrimitives.ReadUInt64LittleEndian(span.Slice(1, 8));
+                        txId = BinaryPrimitives.ReadUInt64LittleEndian(span.Slice(1, 8));
                         ushort tlen = BinaryPrimitives.ReadUInt16LittleEndian(span.Slice(9, 2));
                         keyLen = BinaryPrimitives.ReadInt32LittleEndian(span.Slice(11, 4));
                         int off = 15;
@@ -173,6 +176,7 @@ public static class WalDiagnostics
                             break;
                         }
                         tableName = Encoding.UTF8.GetString(span.Slice(off, tlen));
+                        keyPreview = ToPreview(span.Slice(off + tlen, keyLen));
                         tables.Add(tableName);
                         if (pendingOps.TryGetValue(txId, out var count))
                             pendingOps[txId] = count + 1;
@@ -188,7 +192,7 @@ public static class WalDiagnostics
                         break;
                     }
                     {
-                        ulong txId = BinaryPrimitives.ReadUInt64LittleEndian(span.Slice(1, 8));
+                        txId = BinaryPrimitives.ReadUInt64LittleEndian(span.Slice(1, 8));
                         ushort tlen = BinaryPrimitives.ReadUInt16LittleEndian(span.Slice(9, 2));
                         int off = 11;
                         if (off + tlen > span.Length)
@@ -213,7 +217,7 @@ public static class WalDiagnostics
                         break;
                     }
                     {
-                        ulong txId = BinaryPrimitives.ReadUInt64LittleEndian(span.Slice(1, 8));
+                        txId = BinaryPrimitives.ReadUInt64LittleEndian(span.Slice(1, 8));
                         pendingOps.Remove(txId);
                         lastGoodPosition = fs.Position;
                     }
@@ -231,7 +235,7 @@ public static class WalDiagnostics
 
             if (tailFrames.Count == tailHistory)
                 tailFrames.Dequeue();
-            tailFrames.Enqueue(new WalFrameInfo(frameStart, op, tableName, keyLen, valueLen));
+            tailFrames.Enqueue(new WalFrameInfo(frameStart, op, txId, tableName, keyLen, valueLen, keyPreview));
         }
 
         if (!truncateTail && pendingOps.Count > 0)
@@ -307,4 +311,18 @@ public static class WalDiagnostics
 
     private static bool TryReadExactly(Stream stream, byte[] destination)
         => TryReadExactly(stream, destination.AsSpan());
+
+    private static string ToPreview(ReadOnlySpan<byte> key)
+    {
+        if (key.IsEmpty)
+            return string.Empty;
+
+        int take = Math.Min(key.Length, 16);
+        Span<byte> tmp = stackalloc byte[take];
+        key.Slice(0, take).CopyTo(tmp);
+        var hex = Convert.ToHexString(tmp);
+        if (key.Length <= 16)
+            return hex;
+        return hex + "…";
+    }
 }

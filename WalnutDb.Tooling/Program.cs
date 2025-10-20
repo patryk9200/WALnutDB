@@ -85,13 +85,15 @@ internal static class Program
             foreach (var frame in report.TailFrames)
             {
                 var table = frame.Table is null ? string.Empty : $" table={frame.Table}";
+                var tx = frame.TxId == 0 ? string.Empty : $" tx={frame.TxId}";
+                var keyPreview = string.IsNullOrEmpty(frame.KeyPreview) ? string.Empty : $" key={frame.KeyPreview}";
                 var extra = frame.OpCode switch
                 {
                     WalOp.Put => $" keyLen={frame.KeyLength} valLen={frame.ValueLength}",
                     WalOp.Delete => $" keyLen={frame.KeyLength}",
                     _ => string.Empty
                 };
-                Console.WriteLine($"    @{frame.Offset:N0}: {frame.OpCode}{table}{extra}");
+                Console.WriteLine($"    @{frame.Offset:N0}: {frame.OpCode}{tx}{table}{extra}{keyPreview}");
             }
         }
 
