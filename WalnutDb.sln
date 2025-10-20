@@ -9,6 +9,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "WalnutDb.Tests", "WalnutDb.
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "WalnutDb.Bench", "WalnutDb.Bench\WalnutDb.Bench.csproj", "{098AB45C-2980-42D6-A490-17E81B0B0ACE}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "WalnutDb.Tooling", "WalnutDb.Tooling\WalnutDb.Tooling.csproj", "{334D808F-B35D-48C5-BA74-3815C854C262}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -24,10 +26,14 @@ Global
 		{4013D61A-2E31-4F3F-A73E-7FC3029D3616}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{4013D61A-2E31-4F3F-A73E-7FC3029D3616}.Release|Any CPU.Build.0 = Release|Any CPU
 		{098AB45C-2980-42D6-A490-17E81B0B0ACE}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
-		{098AB45C-2980-42D6-A490-17E81B0B0ACE}.Debug|Any CPU.Build.0 = Debug|Any CPU
-		{098AB45C-2980-42D6-A490-17E81B0B0ACE}.Release|Any CPU.ActiveCfg = Release|Any CPU
-		{098AB45C-2980-42D6-A490-17E81B0B0ACE}.Release|Any CPU.Build.0 = Release|Any CPU
-	EndGlobalSection
+                {098AB45C-2980-42D6-A490-17E81B0B0ACE}.Debug|Any CPU.Build.0 = Debug|Any CPU
+                {098AB45C-2980-42D6-A490-17E81B0B0ACE}.Release|Any CPU.ActiveCfg = Release|Any CPU
+                {098AB45C-2980-42D6-A490-17E81B0B0ACE}.Release|Any CPU.Build.0 = Release|Any CPU
+                {334D808F-B35D-48C5-BA74-3815C854C262}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+                {334D808F-B35D-48C5-BA74-3815C854C262}.Debug|Any CPU.Build.0 = Debug|Any CPU
+                {334D808F-B35D-48C5-BA74-3815C854C262}.Release|Any CPU.ActiveCfg = Release|Any CPU
+                {334D808F-B35D-48C5-BA74-3815C854C262}.Release|Any CPU.Build.0 = Release|Any CPU
+        EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
 	EndGlobalSection
