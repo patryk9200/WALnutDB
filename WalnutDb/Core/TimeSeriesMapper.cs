@@ -13,12 +13,14 @@ internal sealed class TimeSeriesMapper<T>
     private readonly Func<T, byte[]> _serialize;
     private readonly Func<ReadOnlyMemory<byte>, T> _deserialize;
     private readonly JsonSerializerOptions _stj;
+    private readonly bool _storeGuidStringsAsBinary;
 
     public TimeSeriesMapper(TimeSeriesOptions<T> opt)
     {
         _getSeriesId = opt.GetSeriesId ?? throw new ArgumentNullException(nameof(opt.GetSeriesId));
         _getUtc = opt.GetUtcTimestamp ?? throw new ArgumentNullException(nameof(opt.GetUtcTimestamp));
         _stj = opt.JsonOptions ?? new JsonSerializerOptions();
+        _storeGuidStringsAsBinary = opt.StoreGuidStringsAsBinary;
 
         _serialize = opt.Serialize ?? (item => JsonSerializer.SerializeToUtf8Bytes(item, _stj));
         _deserialize = opt.Deserialize ?? (buf =>
@@ -73,14 +75,19 @@ internal sealed class TimeSeriesMapper<T>
         return key;
     }
 
-    private static byte[] EncodeSeriesId(object id)
+    private byte[] EncodeSeriesId(object id)
     {
         return id switch
         {
             byte[] b => b,
             ReadOnlyMemory<byte> rom => rom.ToArray(),
-            Guid g => g.ToByteArray(),
-            string s => Encoding.UTF8.GetBytes(s),
+            Guid g => _storeGuidStringsAsBinary
+                ? g.ToByteArray()
+                : Encoding.UTF8.GetBytes(g.ToString()),
+            string s =>
+                _storeGuidStringsAsBinary && Guid.TryParse(s, out var g2)
+                    ? g2.ToByteArray()
+                    : Encoding.UTF8.GetBytes(s),
             int i => U32(unchecked((uint)(i ^ int.MinValue))),
             long l => U64(unchecked((ulong)(l ^ long.MinValue))),
             uint ui => U32(ui),
