@@ -1443,7 +1443,7 @@ public sealed class WalnutDatabase : IDatabase
             GetId = (T item) => (object)mapper.BuildKey(item),
             Serialize = options.Serialize,
             Deserialize = options.Deserialize,
-            StoreGuidStringsAsBinary = true
+            StoreGuidStringsAsBinary = options.StoreGuidStringsAsBinary
         }, ct).ConfigureAwait(false);
         return new TimeSeriesTable<T>(tbl, mapper);
     }
